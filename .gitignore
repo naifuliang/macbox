@@ -1,0 +1,10 @@
+.build/
+.macbox/
+__pycache__/
+*.pyc
+
+# Generated app bundle executable. Keep Info.plist tracked as bundle metadata.
+MacBoxManager.app/Contents/MacOS/
+
+# Local OS/editor files
+.DS_Store
