@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import platform
@@ -71,6 +72,14 @@ def deletes_path(name: str) -> Path:
     return sandbox_root(name) / "deletes.txt"
 
 
+def docker_runner_path(name: str) -> Path:
+    return sandbox_root(name) / "docker_runner.py"
+
+
+def docker_baseline_path(name: str) -> Path:
+    return sandbox_root(name) / "docker_baseline.json"
+
+
 def config_path(name: str) -> Path:
     return sandbox_root(name) / "config.env"
 
@@ -98,6 +107,14 @@ def virtual_path(name: str, real_path: str) -> Path:
     real = normalize_abs(real_path)
     rel = str(real).lstrip("/")
     return overlay_root(name) / rel
+
+
+def ensure_session_storage(name: str) -> None:
+    root = sandbox_root(name)
+    for sub in ("overlay", "tmp", "home", "cache", "logs"):
+        (root / sub).mkdir(parents=True, exist_ok=True)
+    if not deletes_path(name).exists():
+        deletes_path(name).write_text("")
 
 
 def should_virtualize_path(path: str) -> bool:
@@ -129,11 +146,55 @@ def macfuse_status() -> dict:
     }
 
 
+def docker_status() -> dict:
+    docker = shutil.which("docker")
+    if docker and Path(docker).name != "docker":
+        docker = None
+    status = {
+        "available": bool(docker),
+        "path": docker,
+        "daemon": False,
+        "serverVersion": None,
+        "context": None,
+        "error": None,
+    }
+    if not docker:
+        return status
+    try:
+        result = subprocess.run(
+            [docker, "version", "--format", "{{json .}}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        status["error"] = str(exc)
+        return status
+    if result.returncode != 0:
+        status["error"] = (result.stderr or result.stdout or "").strip()
+        return status
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        payload = {}
+    server = payload.get("Server") if isinstance(payload, dict) else None
+    client = payload.get("Client") if isinstance(payload, dict) else None
+    status["daemon"] = bool(server)
+    if isinstance(server, dict):
+        status["serverVersion"] = server.get("Version")
+    if isinstance(client, dict):
+        status["context"] = client.get("Context")
+    return status
+
+
 def backend_status() -> dict:
     macfuse = macfuse_status()
+    docker = docker_status()
     return {
         "defaultBackend": "prototype",
         "productionBackend": "fuse",
+        "containerBackend": "docker",
         "arbitraryVirtualPaths": {
             "required": True,
             "ready": False,
@@ -143,7 +204,15 @@ def backend_status() -> dict:
             "sessionExecutionImplemented": False,
             "note": "MacBox production sandboxing requires sessions and apps to launch from the mounted FUSE backend; workspace-only backends are not the mainline.",
         },
+        "containerSandbox": {
+            "backend": "docker",
+            "ready": docker["available"] and docker["daemon"],
+            "sessionExecutionImplemented": True,
+            "hostMode": "selected roots copied into an isolated container workspace",
+            "note": "Docker mode is isolated and useful for CLI/dev workflows, but it is not a macOS-native arbitrary-path filesystem.",
+        },
         "macfuse": macfuse,
+        "docker": docker,
         "homebrew": {
             "available": shutil.which("brew") is not None,
             "path": shutil.which("brew"),
@@ -157,8 +226,36 @@ def backend_status() -> dict:
 
 
 def backend_install_plan(backend: str = "macfuse", use_brew: bool = False) -> dict:
-    if backend != "macfuse":
+    if backend not in ("macfuse", "docker"):
         raise SystemExit(f"unsupported backend installer: {backend}")
+    if backend == "docker":
+        status = docker_status()
+        return {
+            "backend": backend,
+            "backendReady": bool(status["available"] and status["daemon"]),
+            "dockerInstalled": bool(status["available"]),
+            "dockerDaemonRunning": bool(status["daemon"]),
+            "requiresAdminApproval": False,
+            "requiresSystemExtensionApproval": False,
+            "guideUrl": "https://docs.docker.com/desktop/install/mac-install/",
+            "steps": [
+                {
+                    "type": "open",
+                    "url": "https://docs.docker.com/desktop/install/mac-install/",
+                    "note": "Install Docker Desktop, OrbStack, or another Docker-compatible runtime.",
+                },
+                {
+                    "type": "verify",
+                    "command": "./macbox docker-status",
+                    "note": "Re-run after starting the Docker daemon.",
+                },
+                {
+                    "type": "verify",
+                    "command": "./scripts/verify-docker-backend.sh",
+                    "note": "Run the Docker backend acceptance check.",
+                },
+            ],
+        }
     brew = shutil.which("brew")
     steps: list[dict[str, str]] = []
     if use_brew and brew:
@@ -228,6 +325,18 @@ def backend_doctor_report() -> dict:
             "ok": bool(status["homebrew"]["available"]),
             "severity": "info",
             "message": f"Homebrew: {status['homebrew']['path']}" if status["homebrew"]["available"] else "Homebrew not found; official installer flow is still supported.",
+        },
+        {
+            "id": "docker-cli",
+            "ok": bool(status["docker"]["available"]),
+            "severity": "info",
+            "message": f"Docker CLI: {status['docker']['path']}" if status["docker"]["available"] else "Docker CLI not found; Docker backend is unavailable.",
+        },
+        {
+            "id": "docker-daemon",
+            "ok": bool(status["docker"]["daemon"]),
+            "severity": "info",
+            "message": "Docker daemon is running" if status["docker"]["daemon"] else "Docker daemon is not running; Docker backend can be installed but not executed yet.",
         },
     ]
     blocking = [check for check in checks if check["severity"] == "blocking" and not check["ok"]]
@@ -984,12 +1093,310 @@ class FuseBackend(SandboxBackend):
         return PrototypeBackend().mark_delete(name, real_path)
 
 
+DOCKER_RUNNER = r'''#!/usr/bin/env python3
+import filecmp
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def copy_root(src, dst):
+    src = Path(src)
+    dst = Path(dst)
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    if src.exists():
+        shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
+
+
+def same_file(a, b):
+    if not a.exists() or not b.exists():
+        return False
+    if a.is_symlink() or b.is_symlink():
+        return a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)
+    if a.is_dir() or b.is_dir():
+        return a.is_dir() and b.is_dir()
+    return filecmp.cmp(a, b, shallow=False)
+
+
+def stage_path(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    if src.is_symlink():
+        os.symlink(os.readlink(src), dst)
+    elif src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+    else:
+        shutil.copy2(src, dst, follow_symlinks=False)
+
+
+def describe_path(path):
+    path = Path(path)
+    if path.is_symlink():
+        return {"type": "symlink", "target": os.readlink(path)}
+    if path.is_dir():
+        return {"type": "dir"}
+    if path.is_file():
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {"type": "file", "sha256": digest.hexdigest(), "size": path.stat().st_size}
+    return {"type": "missing"}
+
+
+def iter_paths(root):
+    root = Path(root)
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*")):
+        yield path
+
+
+def sync_changes(host_root, base_root, work_root, overlay_root, deletes_file):
+    host_root = Path(host_root)
+    base_root = Path(base_root)
+    work_root = Path(work_root)
+    overlay_root = Path(overlay_root)
+    deletes = Path(deletes_file)
+    deletes.parent.mkdir(parents=True, exist_ok=True)
+    deletes.touch(exist_ok=True)
+    baseline = {}
+
+    seen = set()
+    for path in iter_paths(work_root):
+        rel = path.relative_to(work_root)
+        seen.add(rel)
+        base = base_root / rel
+        host = host_root / rel
+        if same_file(path, base):
+            continue
+        baseline[str(host)] = describe_path(base)
+        stage_path(path, overlay_root / str(host).lstrip("/"))
+
+    for path in iter_paths(base_root):
+        rel = path.relative_to(base_root)
+        if rel in seen:
+            continue
+        host = host_root / rel
+        baseline[str(host)] = describe_path(path)
+        with deletes.open("a") as fh:
+            fh.write(str(host) + "\n")
+    return baseline
+
+
+def main():
+    roots = [Path(p).resolve(strict=False) for p in os.environ["MACBOX_DOCKER_ROOTS"].split(os.pathsep) if p]
+    session_root = Path(os.environ.get("MACBOX_DOCKER_SESSION", "/macbox/session"))
+    roots_base = Path(os.environ.get("MACBOX_DOCKER_ROOTS_BASE", "/macbox/roots"))
+    work_base = Path(os.environ.get("MACBOX_DOCKER_WORK", "/macbox/work"))
+    overlay = session_root / "overlay"
+    deletes = session_root / "deletes.txt"
+    baseline_file = session_root / "docker_baseline.json"
+    command = sys.argv[1:] or [os.environ.get("SHELL", "/bin/sh")]
+    work_base.mkdir(parents=True, exist_ok=True)
+
+    for idx, root in enumerate(roots):
+        copy_root(roots_base / str(idx), work_base / str(idx))
+
+    cwd = work_base / "0"
+    proc = subprocess.run(command, cwd=cwd)
+
+    baseline = {}
+    deletes.write_text("")
+    for idx, root in enumerate(roots):
+        baseline.update(sync_changes(root, roots_base / str(idx), work_base / str(idx), overlay, deletes))
+    baseline_file.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n")
+    return proc.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+class DockerBackend(SandboxBackend):
+    name = "docker"
+
+    def status(self) -> dict:
+        return docker_status()
+
+    def require_available(self) -> dict:
+        status = self.status()
+        if not status["available"]:
+            raise SystemExit("Docker CLI is not available. Install Docker Desktop, OrbStack, or another compatible runtime.")
+        if not status["daemon"]:
+            detail = f": {status['error']}" if status.get("error") else ""
+            raise SystemExit(f"Docker daemon is not running{detail}")
+        return status
+
+    def create(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None, plain: bool = False) -> str:
+        if plain:
+            raise SystemExit("plain sessions do not use the docker backend")
+        self.ensure(name, reads, writes)
+        return name
+
+    def ensure(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> None:
+        ensure_session_storage(name)
+        if not config_path(name).exists() or reads is not None or writes is not None:
+            roots = writes or reads or [str(project_root())]
+            write_config(name, reads or roots, writes or roots)
+        cfg = read_config(name)
+        docker_runner_path(name).write_text(DOCKER_RUNNER)
+        if not docker_baseline_path(name).exists():
+            docker_baseline_path(name).write_text("{}\n")
+        write_metadata(
+            name,
+            backend=self.name,
+            sandboxed=True,
+            status=read_metadata(name).get("status", "idle"),
+            readRoots=cfg["read"],
+            writeRoots=cfg["write"],
+            overlayPath=str(overlay_root(name)),
+            dockerImage=read_metadata(name).get("dockerImage", "python:3.12-slim"),
+        )
+
+    def roots(self, name: str) -> list[Path]:
+        cfg = read_config(name)
+        return [normalize_abs(root) for root in (cfg["write"] or cfg["read"] or [str(project_root())])]
+
+    def real_to_virtual(self, name: str, real_path: str) -> Path:
+        return virtual_path(name, real_path)
+
+    def prepare_virtual_path(self, name: str, real_path: str, mkdir: bool = False, directory: bool = False) -> Path:
+        self.ensure(name)
+        path = self.real_to_virtual(name, real_path)
+        if mkdir:
+            target = path if directory else path.parent
+            target.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def prepare_shell(self, name: str, command: list[str], stdin_data: str | None = None) -> "LaunchSpec":
+        self.ensure(name)
+        self.require_available()
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            command = ["/bin/sh"]
+        roots = self.roots(name)
+        argv = [
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "--network",
+            "none",
+            "-e",
+            "MACBOX_DOCKER_ROOTS=" + os.pathsep.join(str(root) for root in roots),
+            "-v",
+            f"{docker_runner_path(name).resolve(strict=False)}:/macbox/session/docker_runner.py:ro",
+            "-v",
+            f"{overlay_root(name).resolve(strict=False)}:/macbox/session/overlay:rw",
+            "-v",
+            f"{deletes_path(name).resolve(strict=False)}:/macbox/session/deletes.txt:rw",
+            "-v",
+            f"{docker_baseline_path(name).resolve(strict=False)}:/macbox/session/docker_baseline.json:rw",
+        ]
+        for idx, root in enumerate(roots):
+            if not root.exists() or not root.is_dir():
+                raise SystemExit(f"docker backend root must be an existing directory: {root}")
+            argv.extend(["-v", f"{root}:/macbox/roots/{idx}:ro"])
+        image = read_metadata(name).get("dockerImage", "python:3.12-slim")
+        argv.extend([image, "python", "/macbox/session/docker_runner.py", *command])
+        return LaunchSpec(
+            argv=argv,
+            env=os.environ.copy(),
+            cwd=project_root(),
+            stdin=stdin_data,
+            text=stdin_data is not None,
+            display_command=" ".join(command),
+        )
+
+    def prepare_app(self, name: str, executable: Path, args: list[str]) -> "LaunchSpec":
+        raise SystemExit("docker backend does not run macOS .app bundles")
+
+    def open_terminal_command(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> str:
+        exe = project_root() / "macbox"
+        self.ensure(name, reads, writes)
+        return f'cd "{quote_sb(project_root())}" && "{quote_sb(exe)}" session --backend docker --name "{quote_sb(name)}"'
+
+    def list_changes(self, name: str) -> list[dict]:
+        return collect_changes(name)
+
+    def list_sessions(self) -> list[dict]:
+        return collect_sessions()
+
+    def environment(self, name: str) -> dict[str, str]:
+        return os.environ.copy()
+
+    def rewrite_line(self, name: str, line: str) -> str:
+        return line
+
+    def apply(self, name: str, clear: bool = False) -> tuple[int, Path | None]:
+        self.ensure(name)
+        try:
+            baseline = json.loads(docker_baseline_path(name).read_text())
+        except json.JSONDecodeError:
+            raise SystemExit(f"invalid Docker baseline metadata: {docker_baseline_path(name)}")
+        changes = collect_changes(name)
+        missing = [item["realPath"] for item in changes if item["realPath"] not in baseline]
+        if missing:
+            raise SystemExit(f"refusing Docker apply without baseline for: {missing[0]}")
+        for item in changes:
+            real = normalize_abs(item["realPath"])
+            expected = baseline[item["realPath"]]
+            if not baseline_matches(real, expected):
+                raise SystemExit(f"refusing Docker apply because real path changed since container run: {real}")
+        result = PrototypeBackend().apply(name, clear)
+        if clear:
+            docker_baseline_path(name).write_text("{}\n")
+        write_metadata(name, backend=self.name)
+        return result
+
+    def discard(self, name: str) -> None:
+        ensure_session_storage(name)
+        shutil.rmtree(overlay_root(name))
+        overlay_root(name).mkdir(parents=True, exist_ok=True)
+        deletes_path(name).write_text("")
+        docker_baseline_path(name).write_text("{}\n")
+
+    def mark_delete(self, name: str, real_path: str) -> Path:
+        ensure_session_storage(name)
+        real = normalize_abs(real_path)
+        with deletes_path(name).open("a") as fh:
+            fh.write(str(real) + "\n")
+        return real
+
+
 def sandbox_backend() -> SandboxBackend:
     return PrototypeBackend()
 
 
 def fuse_backend() -> FuseBackend:
     return FuseBackend()
+
+
+def docker_backend() -> DockerBackend:
+    return DockerBackend()
+
+
+def backend_by_name(name: str) -> SandboxBackend:
+    if name == "prototype":
+        return sandbox_backend()
+    if name == "docker":
+        return docker_backend()
+    if name == "fuse":
+        return fuse_backend()
+    raise SystemExit(f"unsupported backend: {name}")
 
 
 @dataclass
@@ -1003,27 +1410,27 @@ class LaunchSpec:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    sandbox_backend().ensure(args.name, args.read, args.write)
+    backend_by_name(args.backend).ensure(args.name, args.read, args.write)
     print(f"created session: {sandbox_root(args.name)}")
     return 0
 
 
 def cmd_new(args: argparse.Namespace) -> int:
     name = args.name or f"session-{uuid.uuid4().hex[:8]}"
-    sandbox_backend().create(name, args.read, args.write, plain=args.plain)
+    backend_by_name(args.backend).create(name, args.read, args.write, plain=args.plain)
     print(name)
     return 0
 
 
 def cmd_path(args: argparse.Namespace) -> int:
-    backend = sandbox_backend()
+    backend = backend_by_name(args.backend)
     vp = backend.prepare_virtual_path(args.name, args.real_path, mkdir=args.mkdir, directory=args.directory)
     print(vp)
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    backend = sandbox_backend()
+    backend = backend_by_name(args.backend)
     backend.ensure(args.name, args.read, args.write)
     command = args.command
     stdin_data = None if command or sys.stdin.isatty() else sys.stdin.read()
@@ -1047,7 +1454,8 @@ def cmd_session(args: argparse.Namespace) -> int:
 
 
 def cmd_open_terminal(args: argparse.Namespace) -> int:
-    command = sandbox_backend().open_terminal_command(args.name, args.read, args.write)
+    backend_name = read_metadata(args.name).get("backend", args.backend)
+    command = backend_by_name(backend_name).open_terminal_command(args.name, args.read, args.write)
     script = f'tell application "Terminal" to do script "{command.replace(chr(34), chr(92) + chr(34))}"'
     subprocess.run(["osascript", "-e", script], check=True)
     write_metadata(args.name, status="opening", lastCommand="Terminal session")
@@ -1070,7 +1478,7 @@ def find_app_executable(app: Path) -> Path:
 
 
 def cmd_run_app(args: argparse.Namespace) -> int:
-    backend = sandbox_backend()
+    backend = backend_by_name(args.backend)
     backend.ensure(args.name, args.read, args.write)
     app = normalize_abs(args.app)
     exe = find_app_executable(app)
@@ -1094,7 +1502,7 @@ def iter_overlay_entries(name: str):
 
 
 def collect_changes(name: str) -> list[dict]:
-    ensure_sandbox(name)
+    ensure_session_storage(name)
     changes = []
     for overlay, real in iter_overlay_entries(name):
         kind = "dir" if overlay.is_dir() else "file"
@@ -1123,7 +1531,8 @@ def collect_changes(name: str) -> list[dict]:
 
 
 def cmd_changes(args: argparse.Namespace) -> int:
-    changes = sandbox_backend().list_changes(args.name)
+    backend_name = read_metadata(args.name).get("backend", "prototype")
+    changes = backend_by_name(backend_name).list_changes(args.name)
     if args.json:
         print(json.dumps(changes, indent=2))
         return 0
@@ -1149,7 +1558,7 @@ def collect_sessions() -> list[dict]:
         if data.get("sandboxed") is False:
             changes = []
         else:
-            ensure_sandbox(name)
+            backend_by_name(data.get("backend", "prototype")).ensure(name)
             data = read_metadata(name)
             changes = collect_changes(name)
         data.update({
@@ -1180,9 +1589,9 @@ def cmd_show(args: argparse.Namespace) -> int:
     if data.get("sandboxed") is False:
         changes = []
     else:
-        sandbox_backend().ensure(args.name)
+        backend_by_name(data.get("backend", "prototype")).ensure(args.name)
         data = read_metadata(args.name)
-        changes = sandbox_backend().list_changes(args.name)
+        changes = backend_by_name(data.get("backend", "prototype")).list_changes(args.name)
     data.update({
         "name": args.name,
         "path": str(sandbox_root(args.name)),
@@ -1224,8 +1633,38 @@ def backup_existing(path: Path, backup_root: Path) -> None:
         shutil.copy2(path, target, follow_symlinks=False)
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def describe_host_path(path: Path) -> dict:
+    if path.is_symlink():
+        return {"type": "symlink", "target": os.readlink(path)}
+    if path.is_dir():
+        return {"type": "dir"}
+    if path.is_file():
+        return {"type": "file", "sha256": file_sha256(path), "size": path.stat().st_size}
+    return {"type": "missing"}
+
+
+def baseline_matches(path: Path, expected: dict) -> bool:
+    current = describe_host_path(path)
+    if current.get("type") != expected.get("type"):
+        return False
+    if current["type"] == "file":
+        return current.get("sha256") == expected.get("sha256") and current.get("size") == expected.get("size")
+    if current["type"] == "symlink":
+        return current.get("target") == expected.get("target")
+    return True
+
+
 def cmd_apply(args: argparse.Namespace) -> int:
-    applied, backup = sandbox_backend().apply(args.name, clear=args.clear)
+    backend_name = read_metadata(args.name).get("backend", "prototype")
+    applied, backup = backend_by_name(backend_name).apply(args.name, clear=args.clear)
     if applied == 0:
         print("no pending changes")
         return 0
@@ -1235,13 +1674,15 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
-    real = sandbox_backend().mark_delete(args.name, args.real_path)
+    backend_name = read_metadata(args.name).get("backend", "prototype")
+    real = backend_by_name(backend_name).mark_delete(args.name, args.real_path)
     print(f"marked for delete: {real}")
     return 0
 
 
 def cmd_rewrite(args: argparse.Namespace) -> int:
-    print(sandbox_backend().rewrite_line(args.name, args.line))
+    backend_name = read_metadata(args.name).get("backend", "prototype")
+    print(backend_by_name(backend_name).rewrite_line(args.name, args.line))
     return 0
 
 
@@ -1259,15 +1700,34 @@ def cmd_fuse_status(args: argparse.Namespace) -> int:
     return 0 if status["available"] else 2
 
 
+def cmd_docker_status(args: argparse.Namespace) -> int:
+    status = docker_backend().status()
+    if args.json:
+        print(json.dumps(status, indent=2))
+    else:
+        print(f"docker: {'available' if status['available'] else 'unavailable'}")
+        print(f"path: {status['path'] or '-'}")
+        print(f"daemon: {'running' if status['daemon'] else 'not running'}")
+        print(f"server version: {status['serverVersion'] or '-'}")
+        print(f"context: {status['context'] or '-'}")
+        if status.get("error"):
+            print(f"error: {status['error']}")
+    return 0 if status["available"] and status["daemon"] else 2
+
+
 def print_backend_status_text(status: dict) -> None:
     macfuse = status["macfuse"]
+    docker = status["docker"]
     virtual = status["arbitraryVirtualPaths"]
+    container = status["containerSandbox"]
     print(f"default backend: {status['defaultBackend']}")
     print(f"production backend: {status['productionBackend']}")
     print(f"arbitrary virtual paths: {'ready' if virtual['ready'] else 'not ready'}")
     print(f"macFUSE: {'available' if macfuse['available'] else 'unavailable'}")
     print(f"mount command: {macfuse['mountCommand'] or '-'}")
     print(f"python binding: {'yes' if macfuse['pythonBinding'] else 'no'}")
+    print(f"container backend: {status['containerBackend']} ({'ready' if container['ready'] else 'not ready'})")
+    print(f"docker: {'running' if docker['daemon'] else 'not running' if docker['available'] else 'unavailable'}")
     print(f"homebrew: {status['homebrew']['path'] or '-'}")
 
 
@@ -1296,8 +1756,12 @@ def cmd_backend_doctor(args: argparse.Namespace) -> int:
 def print_install_plan(plan: dict) -> None:
     print(f"backend: {plan['backend']}")
     print(f"backend ready: {'yes' if plan['backendReady'] else 'no'}")
-    print(f"macFUSE currently installed: {'yes' if plan['macfuseInstalled'] else 'no'}")
-    print("installation requires macOS administrator/system extension approval.")
+    if plan["backend"] == "macfuse":
+        print(f"macFUSE currently installed: {'yes' if plan['macfuseInstalled'] else 'no'}")
+        print("installation requires macOS administrator/system extension approval.")
+    elif plan["backend"] == "docker":
+        print(f"Docker currently installed: {'yes' if plan['dockerInstalled'] else 'no'}")
+        print(f"Docker daemon running: {'yes' if plan['dockerDaemonRunning'] else 'no'}")
     for idx, step in enumerate(plan["steps"], start=1):
         action = step.get("command") or step.get("url", "")
         print(f"{idx}. {step['type']}: {action}")
@@ -1324,7 +1788,7 @@ def cmd_backend_install(args: argparse.Namespace) -> int:
         return 0
     if args.execute:
         if args.backend != "macfuse":
-            raise SystemExit(f"unsupported backend installer: {args.backend}")
+            raise SystemExit(f"backend installer for {args.backend} is guide-only; use --open")
         brew = shutil.which("brew")
         if not args.use_brew:
             raise SystemExit("--execute currently requires --use-brew so the command is explicit")
@@ -1436,12 +1900,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("init", help="create or update a sandbox")
     p.add_argument("--name", default="default")
+    p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--read", action="append", default=[], help="read root to document/allow")
     p.add_argument("--write", action="append", default=[], help="real root that Apply Changes may modify")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("new", help="create a new sandbox session")
     p.add_argument("--name", default=None)
+    p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--plain", action="store_true", help="create a normal non-sandbox session")
     p.add_argument("--read", action="append", default=[], help="read root to document/allow")
     p.add_argument("--write", action="append", default=[], help="real root that Apply Changes may modify")
@@ -1449,6 +1915,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="run a command or interactive shell in a sandbox backend")
     p.add_argument("--name", default="default")
+    p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--read", action="append", default=None)
     p.add_argument("--write", action="append", default=None)
     p.add_argument("command", nargs=argparse.REMAINDER)
@@ -1456,6 +1923,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("session", help="enter a sandboxed Terminal session")
     p.add_argument("--name", default="default")
+    p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--read", action="append", default=None)
     p.add_argument("--write", action="append", default=None)
     p.add_argument("command", nargs=argparse.REMAINDER)
@@ -1463,12 +1931,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("open-terminal", help="open a sandboxed session in macOS Terminal")
     p.add_argument("--name", default="default")
+    p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--read", action="append", default=None)
     p.add_argument("--write", action="append", default=None)
     p.set_defaults(func=cmd_open_terminal)
 
     p = sub.add_parser("run-app", help="best-effort launch of a .app bundle executable")
     p.add_argument("--name", default="default")
+    p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--read", action="append", default=None)
     p.add_argument("--write", action="append", default=None)
     p.add_argument("app")
@@ -1477,6 +1947,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("path", help="map a real absolute path to its virtual overlay path")
     p.add_argument("--name", default="default")
+    p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--mkdir", action="store_true")
     p.add_argument("--directory", action="store_true")
     p.add_argument("real_path")
@@ -1490,6 +1961,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("fuse-status", help="show macFUSE availability for the future fuse backend")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_fuse_status)
+
+    p = sub.add_parser("docker-status", help="show Docker availability for the container backend")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_docker_status)
 
     p = sub.add_parser("setup", help="guided setup for the mounted FUSE backend")
     p.add_argument("--dry-run", action="store_true", help="show actions without opening pages or running installers")
@@ -1511,7 +1986,7 @@ def build_parser() -> argparse.ArgumentParser:
     bp.set_defaults(func=cmd_backend_doctor)
 
     bp = backend_sub.add_parser("install", help="show or start guided backend installation")
-    bp.add_argument("--backend", default="macfuse", choices=["macfuse"])
+    bp.add_argument("--backend", default="macfuse", choices=["macfuse", "docker"])
     bp.add_argument("--use-brew", action="store_true", help="prefer the Homebrew cask install plan")
     bp.add_argument("--dry-run", action="store_true", help="print the plan and do not open or execute anything")
     bp.add_argument("--open", action="store_true", help="open the official installer guide")

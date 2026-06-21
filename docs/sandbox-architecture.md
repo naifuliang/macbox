@@ -55,6 +55,11 @@ On macOS, the practical first target is a macFUSE backend. A workspace-only
 backend is not a production path for MacBox because the product requirement is
 arbitrary real paths behind a virtual write layer.
 
+Docker is a separate backend line for isolated CLI/dev workflows. It is useful
+when the workload can run inside Linux containers and does not require macOS
+native filesystem or GUI semantics. Docker mode should not replace the macFUSE
+mainline because it cannot provide transparent macOS arbitrary-path behavior.
+
 ## Backend Contract
 
 Phase 1 introduces a backend boundary:
@@ -205,3 +210,38 @@ Acceptance:
 - MacBox can recover or clean orphan mounts.
 - Session locks prevent concurrent apply.
 - Existing running sessions are listed correctly after app restart.
+
+## Docker Backend Roadmap
+
+### Docker Phase 1: Detection And Install Guidance
+
+Acceptance:
+
+- `macbox docker-status --json` reports Docker CLI path, daemon status, context,
+  server version, and connection errors.
+- `macbox backend status --json` includes `containerBackend: docker` and a
+  separate `containerSandbox` readiness block.
+- `macbox backend install --backend docker --dry-run` prints a guide-only plan
+  and does not run installers.
+
+### Docker Phase 2: Isolated Command Execution
+
+Acceptance:
+
+- `macbox run --backend docker --name demo --write <root> -- <command>` runs the
+  command inside a Docker container.
+- The selected host root is mounted read-only.
+- The command runs against an isolated copied workspace.
+- New and modified files are staged under the session overlay.
+- Real host files remain unchanged until `apply`.
+- `scripts/verify-docker-backend.sh` validates unit-level behavior everywhere
+  and runs an end-to-end Docker check when the daemon is available.
+
+### Docker Phase 3: Product Integration
+
+Acceptance:
+
+- Manager UI can create Docker sessions separately from native sandbox sessions.
+- Docker sessions show pending file changes in the existing file sidebar.
+- Docker mode exposes image selection, network mode, and root selection.
+- Compatibility is documented for common coding agents and build tools.
