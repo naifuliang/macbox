@@ -465,9 +465,13 @@ class MacBoxTests(unittest.TestCase):
                 self.assertEqual(spec.argv[:4], ["docker", "run", "--rm", "-i"])
                 self.assertIn("--network", spec.argv)
                 self.assertIn("none", spec.argv)
+                entrypoint_index = spec.argv.index("--entrypoint")
+                self.assertEqual(spec.argv[entrypoint_index + 1], "")
                 self.assertIn("python:3.12-slim", spec.argv)
                 self.assertIn("/macbox/session/docker_runner.py", spec.argv)
                 self.assertEqual(spec.argv[-3:], ["python", "-c", "print(1)"])
+                runner_index = spec.argv.index("/macbox/session/docker_runner.py")
+                self.assertEqual(spec.argv[runner_index - 1], "python3")
                 mounts = [spec.argv[idx + 1] for idx, part in enumerate(spec.argv) if part == "-v"]
                 self.assertTrue(any(mount.endswith(":/macbox/session/docker_runner.py:ro") for mount in mounts))
                 self.assertTrue(any(mount.endswith(":/macbox/session/overlay:rw") for mount in mounts))
@@ -476,6 +480,24 @@ class MacBoxTests(unittest.TestCase):
                 self.assertTrue(macbox_cli.docker_runner_path("docker-launch").exists())
                 metadata = macbox_cli.read_metadata("docker-launch")
                 self.assertEqual(metadata["backend"], "docker")
+            finally:
+                macbox_cli.project_root = old_project_root
+
+    def test_docker_backend_can_override_image(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as root:
+            old_project_root = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                backend = macbox_cli.docker_backend()
+                backend.ensure("docker-image", writes=[root])
+                backend.set_image("docker-image", "local-python:latest")
+                with mock.patch.object(backend, "require_available", return_value={
+                    "available": True,
+                    "daemon": True,
+                }):
+                    spec = backend.prepare_shell("docker-image", ["python", "--version"], None)
+                self.assertIn("local-python:latest", spec.argv)
+                self.assertNotIn("python:3.12-slim", spec.argv)
             finally:
                 macbox_cli.project_root = old_project_root
 

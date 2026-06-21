@@ -8,6 +8,7 @@ python3 -m unittest \
   tests.test_macbox.MacBoxTests.test_docker_install_plan_is_guide_only \
   tests.test_macbox.MacBoxTests.test_backend_status_includes_container_backend \
   tests.test_macbox.MacBoxTests.test_docker_backend_prepare_shell_builds_isolated_run_command \
+  tests.test_macbox.MacBoxTests.test_docker_backend_can_override_image \
   tests.test_macbox.MacBoxTests.test_docker_runner_stages_changes_without_real_write \
   tests.test_macbox.MacBoxTests.test_docker_apply_refuses_external_host_changes \
   tests.test_macbox.MacBoxTests.test_docker_apply_requires_baseline_for_staged_paths
@@ -15,6 +16,7 @@ python3 -m unittest \
 status="$(./macbox docker-status --json || true)"
 python3 - "$status" <<'PY'
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -28,6 +30,19 @@ if not (status.get("available") and status.get("daemon")):
     raise SystemExit(0)
 
 name = f"docker-verify-{uuid.uuid4().hex[:8]}"
+image = os.environ.get("MACBOX_DOCKER_IMAGE", "macbox-docker-test:local")
+if image == "macbox-docker-test:local":
+    probe = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode != 0:
+        build = subprocess.run(
+            ["docker", "build", "-t", image, "docker/test-image"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if build.returncode != 0:
+            print(build.stdout)
+            raise SystemExit(build.returncode)
 with tempfile.TemporaryDirectory(prefix="macbox-docker-real-") as td:
     root = Path(td)
     real = root / "created.txt"
@@ -41,8 +56,10 @@ with tempfile.TemporaryDirectory(prefix="macbox-docker-real-") as td:
             name,
             "--write",
             str(root),
+            "--image",
+            image,
             "--",
-            "python",
+            "python3",
             "-c",
             "from pathlib import Path; Path('created.txt').write_text('docker')",
         ],
