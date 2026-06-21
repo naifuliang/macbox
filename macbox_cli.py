@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -442,69 +443,236 @@ def rewrite_shell_line(name: str, line: str) -> str:
     return rewritten
 
 
+class SandboxBackend:
+    name = "backend"
+
+    def create(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None, plain: bool = False) -> str:
+        raise NotImplementedError
+
+    def ensure(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> None:
+        raise NotImplementedError
+
+    def real_to_virtual(self, name: str, real_path: str) -> Path:
+        raise NotImplementedError
+
+    def prepare_virtual_path(self, name: str, real_path: str, mkdir: bool = False, directory: bool = False) -> Path:
+        raise NotImplementedError
+
+    def prepare_shell(self, name: str, command: list[str], stdin_data: str | None = None) -> "LaunchSpec":
+        raise NotImplementedError
+
+    def prepare_app(self, name: str, executable: Path, args: list[str]) -> "LaunchSpec":
+        raise NotImplementedError
+
+    def open_terminal_command(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> str:
+        raise NotImplementedError
+
+    def list_changes(self, name: str) -> list[dict]:
+        raise NotImplementedError
+
+    def list_sessions(self) -> list[dict]:
+        raise NotImplementedError
+
+    def environment(self, name: str) -> dict[str, str]:
+        raise NotImplementedError
+
+    def rewrite_line(self, name: str, line: str) -> str:
+        raise NotImplementedError
+
+    def apply(self, name: str, clear: bool = False) -> tuple[int, Path | None]:
+        raise NotImplementedError
+
+    def discard(self, name: str) -> None:
+        raise NotImplementedError
+
+    def mark_delete(self, name: str, real_path: str) -> Path:
+        raise NotImplementedError
+
+
+class PrototypeBackend(SandboxBackend):
+    name = "prototype"
+
+    def create(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None, plain: bool = False) -> str:
+        if plain:
+            root = sandbox_root(name)
+            root.mkdir(parents=True, exist_ok=True)
+            write_metadata(name, sandboxed=False, status="idle", readRoots=[], writeRoots=[], overlayPath=None, backend=self.name)
+            return name
+        self.ensure(name, reads, writes)
+        return name
+
+    def ensure(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> None:
+        ensure_sandbox(name, reads, writes)
+        write_metadata(name, backend=self.name)
+
+    def real_to_virtual(self, name: str, real_path: str) -> Path:
+        return virtual_path(name, real_path)
+
+    def prepare_virtual_path(self, name: str, real_path: str, mkdir: bool = False, directory: bool = False) -> Path:
+        self.ensure(name)
+        vp = self.real_to_virtual(name, real_path)
+        if mkdir:
+            if directory:
+                vp.mkdir(parents=True, exist_ok=True)
+            else:
+                vp.parent.mkdir(parents=True, exist_ok=True)
+        return vp
+
+    def prepare_shell(self, name: str, command: list[str], stdin_data: str | None = None) -> "LaunchSpec":
+        self.ensure(name)
+        rewritten_stdin = None
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            shell = os.environ.get("SHELL", "/bin/zsh")
+            command = [shell, "-i"]
+            if Path(shell).name in ("bash", "zsh"):
+                command = [shell, "-i"] if Path(shell).name == "zsh" else [shell, "--rcfile", str(rcfile_path(name)), "-i"]
+            if stdin_data is not None:
+                lines = stdin_data.splitlines(keepends=True)
+                rewritten_stdin = "".join(
+                    self.rewrite_line(name, line.removesuffix("\n").removesuffix("\r")) + ("\n" if line.endswith("\n") else "")
+                    for line in lines
+                )
+        elif len(command) >= 3 and Path(command[0]).name == "zsh" and command[1] == "-lc":
+            command = [command[0], command[1], self.rewrite_line(name, command[2]), *command[3:]]
+
+        env = self.environment(name)
+        if Path(env.get("SHELL", "/bin/zsh")).name == "zsh" and command and Path(command[0]).name == "zsh" and "-i" in command:
+            zhome = sandbox_root(name) / "home"
+            env["ZDOTDIR"] = str(zhome)
+            (zhome / ".zshrc").write_text(rcfile_path(name).read_text())
+
+        return LaunchSpec(
+            argv=["sandbox-exec", "-f", str(profile_path(name)), *command],
+            env=env,
+            cwd=project_root(),
+            stdin=rewritten_stdin,
+            text=rewritten_stdin is not None,
+            display_command=" ".join(command),
+        )
+
+    def prepare_app(self, name: str, executable: Path, args: list[str]) -> "LaunchSpec":
+        self.ensure(name)
+        return LaunchSpec(
+            argv=["sandbox-exec", "-f", str(profile_path(name)), str(executable), *args],
+            env=self.environment(name),
+            cwd=project_root(),
+            display_command=" ".join([str(executable), *args]),
+        )
+
+    def open_terminal_command(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> str:
+        exe = project_root() / "macbox"
+        meta = read_metadata(name)
+        if meta.get("sandboxed") is False:
+            sandbox_root(name).mkdir(parents=True, exist_ok=True)
+            return f'cd "{quote_sb(project_root())}" && exec "${{SHELL:-/bin/zsh}}" -i'
+        self.ensure(name, reads, writes)
+        return f'cd "{quote_sb(project_root())}" && "{quote_sb(exe)}" session --name "{quote_sb(name)}"'
+
+    def list_changes(self, name: str) -> list[dict]:
+        return collect_changes(name)
+
+    def list_sessions(self) -> list[dict]:
+        return collect_sessions()
+
+    def environment(self, name: str) -> dict[str, str]:
+        return sandbox_environment(name)
+
+    def rewrite_line(self, name: str, line: str) -> str:
+        return rewrite_shell_line(name, line)
+
+    def apply(self, name: str, clear: bool = False) -> tuple[int, Path | None]:
+        self.ensure(name)
+        cfg = read_config(name)
+        entries = list(iter_overlay_entries(name) or [])
+        deletes = [normalize_abs(p) for p in deletes_path(name).read_text().splitlines() if p]
+        if not entries and not deletes:
+            return 0, None
+        backup = sandbox_root(name) / "backups" / _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        applied = 0
+        for target in deletes:
+            if not path_allowed(target, cfg["write"]):
+                raise SystemExit(f"refusing delete outside configured write roots: {target}")
+            backup_existing(target, backup)
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+            applied += 1
+        for src, real in entries:
+            target = Path(str(real))
+            if not path_allowed(target, cfg["write"]):
+                raise SystemExit(f"refusing write outside configured write roots: {target}")
+            backup_existing(target, backup)
+            copy_entry(src, target)
+            applied += 1
+        if clear:
+            self.discard(name)
+        return applied, backup
+
+    def discard(self, name: str) -> None:
+        self.ensure(name)
+        shutil.rmtree(overlay_root(name))
+        overlay_root(name).mkdir(parents=True, exist_ok=True)
+        deletes_path(name).write_text("")
+
+    def mark_delete(self, name: str, real_path: str) -> Path:
+        self.ensure(name)
+        real = normalize_abs(real_path)
+        with deletes_path(name).open("a") as fh:
+            fh.write(str(real) + "\n")
+        return real
+
+
+def sandbox_backend() -> SandboxBackend:
+    return PrototypeBackend()
+
+
+@dataclass
+class LaunchSpec:
+    argv: list[str]
+    env: dict[str, str]
+    cwd: Path
+    stdin: str | None = None
+    text: bool = False
+    display_command: str = ""
+
+
 def cmd_init(args: argparse.Namespace) -> int:
-    ensure_sandbox(args.name, args.read, args.write)
+    sandbox_backend().ensure(args.name, args.read, args.write)
     print(f"created session: {sandbox_root(args.name)}")
     return 0
 
 
 def cmd_new(args: argparse.Namespace) -> int:
     name = args.name or f"session-{uuid.uuid4().hex[:8]}"
-    if args.plain:
-        root = sandbox_root(name)
-        root.mkdir(parents=True, exist_ok=True)
-        write_metadata(name, sandboxed=False, status="idle", readRoots=[], writeRoots=[], overlayPath=None)
-        print(name)
-        return 0
-    ensure_sandbox(name, args.read, args.write)
+    sandbox_backend().create(name, args.read, args.write, plain=args.plain)
     print(name)
     return 0
 
 
 def cmd_path(args: argparse.Namespace) -> int:
-    ensure_sandbox(args.name)
-    vp = virtual_path(args.name, args.real_path)
-    if args.mkdir:
-        if args.directory:
-            vp.mkdir(parents=True, exist_ok=True)
-        else:
-            vp.parent.mkdir(parents=True, exist_ok=True)
+    backend = sandbox_backend()
+    vp = backend.prepare_virtual_path(args.name, args.real_path, mkdir=args.mkdir, directory=args.directory)
     print(vp)
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    ensure_sandbox(args.name, args.read, args.write)
+    backend = sandbox_backend()
+    backend.ensure(args.name, args.read, args.write)
     command = args.command
-    if command and command[0] == "--":
-        command = command[1:]
-    rewritten_stdin = None
-    if not command:
-        shell = os.environ.get("SHELL", "/bin/zsh")
-        command = [shell, "-i"]
-        if Path(shell).name in ("bash", "zsh"):
-            command = [shell, "-i"] if Path(shell).name == "zsh" else [shell, "--rcfile", str(rcfile_path(args.name)), "-i"]
-        if not sys.stdin.isatty():
-            stdin_data = sys.stdin.read()
-            lines = stdin_data.splitlines(keepends=True)
-            rewritten_stdin = "".join(
-                rewrite_shell_line(args.name, line.removesuffix("\n").removesuffix("\r")) + ("\n" if line.endswith("\n") else "")
-                for line in lines
-            )
-    elif len(command) >= 3 and Path(command[0]).name == "zsh" and command[1] == "-lc":
-        command = [command[0], command[1], rewrite_shell_line(args.name, command[2]), *command[3:]]
-    env = sandbox_environment(args.name)
-    if not args.command and Path(env.get("SHELL", "/bin/zsh")).name == "zsh":
-        zhome = sandbox_root(args.name) / "home"
-        env["ZDOTDIR"] = str(zhome)
-        (zhome / ".zshrc").write_text(rcfile_path(args.name).read_text())
-    write_metadata(args.name, status="running", lastCommand=" ".join(command), pid=os.getpid())
+    stdin_data = None if command or sys.stdin.isatty() else sys.stdin.read()
+    spec = backend.prepare_shell(args.name, command, stdin_data=stdin_data)
+    write_metadata(args.name, status="running", lastCommand=spec.display_command, pid=os.getpid())
     try:
         proc = subprocess.run(
-            ["sandbox-exec", "-f", str(profile_path(args.name)), *command],
-            env=env,
-            input=rewritten_stdin,
-            text=rewritten_stdin is not None,
+            spec.argv,
+            cwd=spec.cwd,
+            env=spec.env,
+            input=spec.stdin,
+            text=spec.text,
         )
         return proc.returncode
     finally:
@@ -516,14 +684,7 @@ def cmd_session(args: argparse.Namespace) -> int:
 
 
 def cmd_open_terminal(args: argparse.Namespace) -> int:
-    exe = project_root() / "macbox"
-    meta = read_metadata(args.name)
-    if meta.get("sandboxed") is False:
-        sandbox_root(args.name).mkdir(parents=True, exist_ok=True)
-        command = f'cd "{quote_sb(project_root())}" && exec "${{SHELL:-/bin/zsh}}" -i'
-    else:
-        ensure_sandbox(args.name, args.read, args.write)
-        command = f'cd "{quote_sb(project_root())}" && "{quote_sb(exe)}" session --name "{quote_sb(args.name)}"'
+    command = sandbox_backend().open_terminal_command(args.name, args.read, args.write)
     script = f'tell application "Terminal" to do script "{command.replace(chr(34), chr(92) + chr(34))}"'
     subprocess.run(["osascript", "-e", script], check=True)
     write_metadata(args.name, status="opening", lastCommand="Terminal session")
@@ -546,12 +707,13 @@ def find_app_executable(app: Path) -> Path:
 
 
 def cmd_run_app(args: argparse.Namespace) -> int:
-    ensure_sandbox(args.name, args.read, args.write)
+    backend = sandbox_backend()
+    backend.ensure(args.name, args.read, args.write)
     app = normalize_abs(args.app)
     exe = find_app_executable(app)
-    env = sandbox_environment(args.name)
+    spec = backend.prepare_app(args.name, exe, args.args)
     print(f"starting {app} via {exe}")
-    proc = subprocess.run(["sandbox-exec", "-f", str(profile_path(args.name)), str(exe), *args.args], env=env)
+    proc = subprocess.run(spec.argv, cwd=spec.cwd, env=spec.env, input=spec.stdin, text=spec.text)
     return proc.returncode
 
 
@@ -598,8 +760,7 @@ def collect_changes(name: str) -> list[dict]:
 
 
 def cmd_changes(args: argparse.Namespace) -> int:
-    ensure_sandbox(args.name)
-    changes = collect_changes(args.name)
+    changes = sandbox_backend().list_changes(args.name)
     if args.json:
         print(json.dumps(changes, indent=2))
         return 0
@@ -639,7 +800,7 @@ def collect_sessions() -> list[dict]:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    sessions = collect_sessions()
+    sessions = sandbox_backend().list_sessions()
     if args.json:
         print(json.dumps(sessions, indent=2))
         return 0
@@ -656,9 +817,9 @@ def cmd_show(args: argparse.Namespace) -> int:
     if data.get("sandboxed") is False:
         changes = []
     else:
-        ensure_sandbox(args.name)
+        sandbox_backend().ensure(args.name)
         data = read_metadata(args.name)
-        changes = collect_changes(args.name)
+        changes = sandbox_backend().list_changes(args.name)
     data.update({
         "name": args.name,
         "path": str(sandbox_root(args.name)),
@@ -668,8 +829,9 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(json.dumps(data, indent=2))
     else:
         print(f"name: {args.name}")
+        print(f"backend: {data.get('backend', 'prototype' if data.get('sandboxed') is not False else 'plain')}")
         print(f"status: {data.get('status', 'idle')}")
-        print(f"overlay: {data.get('overlayPath', overlay_root(args.name))}")
+        print(f"storage: {data.get('overlayPath', overlay_root(args.name))}")
         print(f"changes: {len(data['changes'])}")
     return 0
 
@@ -700,51 +862,23 @@ def backup_existing(path: Path, backup_root: Path) -> None:
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
-    ensure_sandbox(args.name)
-    cfg = read_config(args.name)
-    entries = list(iter_overlay_entries(args.name) or [])
-    deletes = [normalize_abs(p) for p in deletes_path(args.name).read_text().splitlines() if p]
-    if not entries and not deletes:
+    applied, backup = sandbox_backend().apply(args.name, clear=args.clear)
+    if applied == 0:
         print("no pending changes")
         return 0
-    backup = sandbox_root(args.name) / "backups" / _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    applied = 0
-    for target in deletes:
-        if not path_allowed(target, cfg["write"]):
-            raise SystemExit(f"refusing delete outside configured write roots: {target}")
-        backup_existing(target, backup)
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        elif target.exists() or target.is_symlink():
-            target.unlink()
-        applied += 1
-    for src, real in entries:
-        target = Path(str(real))
-        if not path_allowed(target, cfg["write"]):
-            raise SystemExit(f"refusing write outside configured write roots: {target}")
-        backup_existing(target, backup)
-        copy_entry(src, target)
-        applied += 1
-    if args.clear:
-        shutil.rmtree(overlay_root(args.name))
-        overlay_root(args.name).mkdir(parents=True, exist_ok=True)
-        deletes_path(args.name).write_text("")
     print(f"applied {applied} change(s)")
     print(f"backup: {backup}")
     return 0
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
-    ensure_sandbox(args.name)
-    real = normalize_abs(args.real_path)
-    with deletes_path(args.name).open("a") as fh:
-        fh.write(str(real) + "\n")
+    real = sandbox_backend().mark_delete(args.name, args.real_path)
     print(f"marked for delete: {real}")
     return 0
 
 
 def cmd_rewrite(args: argparse.Namespace) -> int:
-    print(rewrite_shell_line(args.name, args.line))
+    print(sandbox_backend().rewrite_line(args.name, args.line))
     return 0
 
 
@@ -765,7 +899,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--write", action="append", default=[], help="real root that Apply Changes may modify")
     p.set_defaults(func=cmd_new)
 
-    p = sub.add_parser("run", help="run a command or interactive shell under sandbox-exec")
+    p = sub.add_parser("run", help="run a command or interactive shell in a sandbox backend")
     p.add_argument("--name", default="default")
     p.add_argument("--read", action="append", default=None)
     p.add_argument("--write", action="append", default=None)

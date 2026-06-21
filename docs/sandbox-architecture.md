@@ -55,21 +55,27 @@ On macOS, the practical first target is a macFUSE backend.
 
 ## Backend Contract
 
-The next implementation phase should introduce a backend boundary:
+Phase 1 introduces a backend boundary:
 
 ```text
 SandboxBackend
   create(session)
-  start(session)
-  stop(session)
+  ensure(session)
+  prepareShell(session, command)
+  prepareApp(session, executable, args)
+  openTerminalCommand(session)
   realToVirtual(path)
+  prepareVirtualPath(path)
   listChanges(session)
+  listSessions()
   apply(session)
   discard(session)
+  markDelete(path)
 ```
 
-The CLI and GUI should depend on this contract, not on the prototype overlay
-layout.
+The CLI should depend on this contract, not on the prototype overlay layout.
+The current implementation provides `PrototypeBackend`, which preserves the
+Phase 0 behavior while making `FuseBackend` a separate future implementation.
 
 ## Stage Roadmap And Acceptance
 
@@ -88,9 +94,13 @@ Acceptance:
 
 Acceptance:
 
-- CLI and GUI read session/change data through a backend abstraction.
+- CLI session, path, changes, apply, delete, rewrite, and environment flows call
+  through a backend abstraction.
+- CLI shell/app launch flows execute backend-provided launch specs instead of
+  hard-coding the prototype `sandbox-exec` command shape.
 - Existing prototype behavior still passes all Phase 0 tests.
-- Backend contract tests cover create, changes, apply, discard, and path mapping.
+- Backend contract tests cover create, changes, apply, discard, delete, launch
+  specs, and path mapping.
 
 ### Phase 2: macFUSE Read-Only Mount
 
