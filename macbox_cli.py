@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,21 @@ def interpose_library_path() -> Path:
 
 def mount_record_path(name: str) -> Path:
     return sandbox_root(name) / "mount.json"
+
+
+def fuse_helper_path() -> Path:
+    return project_root() / "macbox_fuse.py"
+
+
+def wait_for_mount(mount: Path, proc: subprocess.Popen, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        if os.path.ismount(mount):
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def rcfile_path(name: str) -> Path:
@@ -122,7 +138,9 @@ def backend_status() -> dict:
             "required": True,
             "ready": False,
             "backend": "fuse",
-            "note": "MacBox production sandboxing requires a mounted overlay filesystem; workspace-only backends are not the mainline.",
+            "readOnlyMountImplemented": True,
+            "writeOverlayImplemented": False,
+            "note": "MacBox production sandboxing requires mounted overlay writes; workspace-only backends are not the mainline.",
         },
         "macfuse": macfuse,
         "homebrew": {
@@ -184,7 +202,7 @@ def backend_doctor_report() -> dict:
             "id": "arbitrary-virtual-paths",
             "ok": False,
             "severity": "blocking",
-            "message": "Production arbitrary-path virtual writes require the mounted overlay backend.",
+            "message": "Production arbitrary-path virtual writes require overlay write support on the mounted backend.",
         },
         {
             "id": "macfuse-installed",
@@ -195,8 +213,8 @@ def backend_doctor_report() -> dict:
         {
             "id": "macfuse-mount-command",
             "ok": bool(macfuse["mountCommand"]),
-            "severity": "blocking",
-            "message": f"mount command: {macfuse['mountCommand']}" if macfuse["mountCommand"] else "mount_macfuse/mount_osxfuse not found in PATH.",
+            "severity": "info",
+            "message": f"mount command: {macfuse['mountCommand']}" if macfuse["mountCommand"] else "mount_macfuse/mount_osxfuse not found in PATH; fusepy may still mount through the macFUSE framework.",
         },
         {
             "id": "python-fuse-binding",
@@ -213,12 +231,12 @@ def backend_doctor_report() -> dict:
     ]
     blocking = [check for check in checks if check["severity"] == "blocking" and not check["ok"]]
     next_actions: list[str] = []
-    if any(check["id"] in ("macfuse-installed", "macfuse-mount-command") for check in blocking):
+    if any(check["id"] == "macfuse-installed" for check in blocking):
         next_actions.append("Install macFUSE with './macbox backend install --backend macfuse --open' or '--use-brew --execute'.")
     if any(check["id"] == "python-fuse-binding" for check in blocking):
         next_actions.append("Install a Python FUSE binding for the interpreter that runs MacBox.")
     if any(check["id"] == "arbitrary-virtual-paths" for check in blocking):
-        next_actions.append("Implement and verify the mounted overlay filesystem backend.")
+        next_actions.append("Implement overlay writes on the mounted FUSE backend.")
     if not next_actions:
         next_actions.append("Backend dependencies are present; continue mounted overlay verification.")
     return {
@@ -811,15 +829,86 @@ class FuseBackend(SandboxBackend):
             mountPath=read_metadata(name).get("mountPath"),
         )
 
-    def mount_readonly(self, name: str, mount_path: str, reads: list[str] | None = None, writes: list[str] | None = None) -> Path:
+    def mount_readonly(
+        self,
+        name: str,
+        mount_path: str,
+        reads: list[str] | None = None,
+        writes: list[str] | None = None,
+        foreground: bool = False,
+    ) -> Path:
         self.require_available()
         self.ensure(name, reads, writes)
         mount = normalize_abs(mount_path)
         mount.mkdir(parents=True, exist_ok=True)
-        raise SystemExit(
-            "macFUSE is available, but MacBox read-only FUSE mounting is not implemented in this build yet. "
-            f"Prepared mount directory: {mount}"
-        )
+        helper = fuse_helper_path()
+        if not helper.exists():
+            raise SystemExit(f"missing FUSE helper: {helper}")
+        command = [sys.executable, str(helper), "--session", name, "--mount", str(mount), "--foreground"]
+        if foreground:
+            proc = subprocess.Popen(command, cwd=project_root())
+            if not wait_for_mount(mount, proc):
+                if proc.poll() is None:
+                    proc.terminate()
+                raise SystemExit(f"FUSE helper did not mount {mount}")
+            write_metadata(
+                name,
+                backend=self.name,
+                status="mounted",
+                mountPath=str(mount),
+                mountPid=proc.pid,
+                mountStartedAt=now_iso(),
+                readOnly=True,
+            )
+            mount_record_path(name).write_text(json.dumps({
+                "backend": self.name,
+                "mountPath": str(mount),
+                "pid": proc.pid,
+                "readOnly": True,
+                "foreground": True,
+                "startedAt": now_iso(),
+                "command": command,
+            }, indent=2) + "\n")
+            returncode = proc.wait()
+            write_metadata(name, status="idle", mountPath=None, mountPid=None, readOnly=None)
+            record = mount_record_path(name)
+            if record.exists():
+                record.unlink()
+            if returncode != 0:
+                raise SystemExit(returncode)
+        else:
+            logs = sandbox_root(name) / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            stdout = (logs / "fuse.out.log").open("a")
+            stderr = (logs / "fuse.err.log").open("a")
+            proc = subprocess.Popen(command, cwd=project_root(), stdout=stdout, stderr=stderr, text=True)
+            stdout.close()
+            stderr.close()
+            if not wait_for_mount(mount, proc):
+                message = logs / "fuse.err.log"
+                code = proc.poll()
+                if code is None:
+                    proc.terminate()
+                    raise SystemExit(f"FUSE helper did not mount {mount} before timeout. See {message}")
+                raise SystemExit(f"FUSE helper exited early with {code}. See {message}")
+            write_metadata(
+                name,
+                backend=self.name,
+                status="mounted",
+                mountPath=str(mount),
+                mountPid=proc.pid,
+                mountStartedAt=now_iso(),
+                readOnly=True,
+            )
+            mount_record_path(name).write_text(json.dumps({
+                "backend": self.name,
+                "mountPath": str(mount),
+                "pid": proc.pid,
+                "readOnly": True,
+                "startedAt": now_iso(),
+                "command": command,
+            }, indent=2) + "\n")
+        return mount
 
     def unmount(self, name: str) -> None:
         data = read_metadata(name)
@@ -827,8 +916,14 @@ class FuseBackend(SandboxBackend):
         if not mount:
             print(f"no recorded mount for session: {name}")
             return
-        subprocess.run(["/sbin/umount", mount], check=False)
-        write_metadata(name, mountPath=None)
+        result = subprocess.run(["/sbin/umount", mount], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise SystemExit(f"failed to unmount {mount}: {detail or result.returncode}")
+        write_metadata(name, status="idle", mountPath=None, mountPid=None, readOnly=None)
+        record = mount_record_path(name)
+        if record.exists():
+            record.unlink()
 
     def real_to_virtual(self, name: str, real_path: str) -> Path:
         data = read_metadata(name)
@@ -1231,8 +1326,11 @@ def cmd_backend_install(args: argparse.Namespace) -> int:
 def cmd_mount(args: argparse.Namespace) -> int:
     if args.backend != "fuse":
         raise SystemExit(f"unsupported backend for mount: {args.backend}")
-    mount = fuse_backend().mount_readonly(args.name, args.mount, args.read, args.write)
-    print(f"mounted {args.name}: {mount}")
+    mount = fuse_backend().mount_readonly(args.name, args.mount, args.read, args.write, foreground=args.foreground)
+    if args.foreground:
+        print(f"foreground mount exited: {args.name}: {mount}")
+    else:
+        print(f"mounted {args.name}: {mount}")
     return 0
 
 
@@ -1328,6 +1426,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mount", required=True, help="mount point path")
     p.add_argument("--read", action="append", default=None)
     p.add_argument("--write", action="append", default=None)
+    p.add_argument("--foreground", action="store_true", help="run the FUSE helper in the foreground")
     p.set_defaults(func=cmd_mount)
 
     p = sub.add_parser("unmount", help="unmount a sandbox backend")

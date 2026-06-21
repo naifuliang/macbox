@@ -147,6 +147,9 @@ Acceptance:
 - Reads through the virtual root fall back to the real disk.
 - The mount presents arbitrary absolute real paths under the virtual root.
 - `macbox unmount --name demo` cleans up the mount.
+- `scripts/verify-fuse-readonly.sh` validates helper logic and mount
+  orchestration on all hosts; when macFUSE and the Python binding are present,
+  it also performs a real mount/read/reject-write/unmount check.
 
 ### Phase 5: Overlay Writes
 
