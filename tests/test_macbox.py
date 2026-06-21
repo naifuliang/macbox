@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 import macbox_cli
 
@@ -193,6 +194,124 @@ class MacBoxTests(unittest.TestCase):
         self.assertIn("framework", status)
         self.assertIn("mountCommand", status)
         self.assertIn("pythonBinding", status)
+
+    def test_backend_status_declares_arbitrary_paths_not_ready(self):
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": False,
+            "filesystem": None,
+            "framework": None,
+            "mountCommand": None,
+            "pythonBinding": False,
+        }
+        try:
+            status = macbox_cli.backend_status()
+            self.assertEqual(status["productionBackend"], "fuse")
+            self.assertTrue(status["arbitraryVirtualPaths"]["required"])
+            self.assertFalse(status["arbitraryVirtualPaths"]["ready"])
+            self.assertIn("workspace-only", status["arbitraryVirtualPaths"]["note"])
+        finally:
+            macbox_cli.macfuse_status = old_status
+
+    def test_backend_doctor_reports_missing_macfuse_as_blocking(self):
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": False,
+            "filesystem": None,
+            "framework": None,
+            "mountCommand": None,
+            "pythonBinding": False,
+        }
+        try:
+            report = macbox_cli.backend_doctor_report()
+            self.assertFalse(report["ready"])
+            blocking_ids = {check["id"] for check in report["checks"] if not check["ok"] and check["severity"] == "blocking"}
+            self.assertIn("arbitrary-virtual-paths", blocking_ids)
+            self.assertIn("macfuse-installed", blocking_ids)
+            self.assertIn("python-fuse-binding", blocking_ids)
+            self.assertTrue(any("Install macFUSE" in action for action in report["nextActions"]))
+            self.assertTrue(any("mounted overlay filesystem" in action for action in report["nextActions"]))
+        finally:
+            macbox_cli.macfuse_status = old_status
+
+    def test_backend_doctor_reports_implementation_gap_after_dependencies(self):
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": True,
+            "filesystem": "/Library/Filesystems/macfuse.fs",
+            "framework": None,
+            "mountCommand": "/usr/local/bin/mount_macfuse",
+            "pythonBinding": True,
+        }
+        try:
+            report = macbox_cli.backend_doctor_report()
+            self.assertFalse(report["ready"])
+            blocking_ids = {check["id"] for check in report["checks"] if not check["ok"] and check["severity"] == "blocking"}
+            self.assertEqual(blocking_ids, {"arbitrary-virtual-paths"})
+            self.assertTrue(any("mounted overlay filesystem" in action for action in report["nextActions"]))
+            self.assertFalse(report["installPlan"]["backendReady"])
+            self.assertTrue(report["installPlan"]["macfuseInstalled"])
+        finally:
+            macbox_cli.macfuse_status = old_status
+
+    def test_backend_install_plan_prefers_brew_when_requested(self):
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": False,
+            "filesystem": None,
+            "framework": None,
+            "mountCommand": None,
+            "pythonBinding": False,
+        }
+        try:
+            with mock.patch("macbox_cli.shutil.which", return_value="/opt/homebrew/bin/brew"):
+                plan = macbox_cli.backend_install_plan(use_brew=True)
+            self.assertEqual(plan["backend"], "macfuse")
+            self.assertEqual(plan["steps"][0]["type"], "command")
+            self.assertIn("install --cask macfuse", plan["steps"][0]["command"])
+            self.assertTrue(plan["requiresAdminApproval"])
+            self.assertFalse(plan["backendReady"])
+            self.assertFalse(plan["macfuseInstalled"])
+        finally:
+            macbox_cli.macfuse_status = old_status
+
+    def test_backend_install_execute_requires_explicit_brew(self):
+        args = Namespace(backend="macfuse", use_brew=False, dry_run=False, open=False, execute=True, json=False)
+        with self.assertRaises(SystemExit) as ctx:
+            macbox_cli.cmd_backend_install(args)
+        self.assertIn("--use-brew", str(ctx.exception))
+
+    def test_backend_install_rejects_open_and_execute_together(self):
+        args = Namespace(backend="macfuse", use_brew=True, dry_run=False, open=True, execute=True, json=False)
+        with self.assertRaises(SystemExit) as ctx:
+            macbox_cli.cmd_backend_install(args)
+        self.assertIn("cannot be used together", str(ctx.exception))
+
+    def test_backend_install_rejects_json_with_action_flags(self):
+        args = Namespace(backend="macfuse", use_brew=True, dry_run=False, open=False, execute=True, json=True)
+        with self.assertRaises(SystemExit) as ctx:
+            macbox_cli.cmd_backend_install(args)
+        self.assertIn("--json", str(ctx.exception))
+
+    def test_backend_install_execute_runs_brew_when_explicit(self):
+        args = Namespace(backend="macfuse", use_brew=True, dry_run=False, open=False, execute=True, json=False)
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": False,
+            "filesystem": None,
+            "framework": None,
+            "mountCommand": None,
+            "pythonBinding": False,
+        }
+        try:
+            with mock.patch("macbox_cli.shutil.which", return_value="/opt/homebrew/bin/brew"), \
+                    mock.patch("macbox_cli.subprocess.run") as run:
+                run.return_value.returncode = 0
+                rc = macbox_cli.cmd_backend_install(args)
+            self.assertEqual(rc, 0)
+            run.assert_called_once_with(["/opt/homebrew/bin/brew", "install", "--cask", "macfuse"])
+        finally:
+            macbox_cli.macfuse_status = old_status
 
     def test_fuse_backend_mount_reports_unavailable(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:

@@ -24,6 +24,8 @@ Known boundary:
   `mkdir`, and `touch`.
 - A production backend should move to a mounted overlay filesystem, most likely
   macFUSE on macOS.
+- A workspace-only backend is not the MacBox product path. The baseline
+  requirement is arbitrary real paths connected through a virtual write layer.
 
 See [docs/sandbox-architecture.md](docs/sandbox-architecture.md) for the
 architecture decision and staged roadmap.
@@ -98,10 +100,30 @@ The manager opens as a compact glass-style window:
 ./macbox new --name plain --plain
 ```
 
+## Production Backend Setup
+
+The production backend is planned around macFUSE plus a Python FUSE binding so
+MacBox can mount arbitrary real paths behind a virtual copy-on-write layer.
+Current commands expose dependency status and guided setup:
+
+```sh
+./macbox backend status
+./macbox backend doctor
+./macbox backend install --backend macfuse --dry-run
+./macbox backend install --backend macfuse --open
+```
+
+The installer command is explicit by design. It prints the plan by default,
+opens the official macFUSE install guide only with `--open`, and only runs the
+Homebrew cask path with `--use-brew --execute`. Installing macFUSE alone does
+not make the production backend ready; `backend doctor` also checks the Python
+FUSE binding and the mounted overlay implementation status.
+
 ## Verify
 
 ```sh
 ./scripts/verify-prototype.sh
+./scripts/verify-backend-installer.sh
 ```
 
 The integration test uses `sandbox-exec`. If the outer execution environment

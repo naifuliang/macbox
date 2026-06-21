@@ -5,6 +5,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -109,6 +110,124 @@ def macfuse_status() -> dict:
         "framework": str(framework) if framework.exists() else None,
         "mountCommand": mount_command,
         "pythonBinding": python_binding,
+    }
+
+
+def backend_status() -> dict:
+    macfuse = macfuse_status()
+    return {
+        "defaultBackend": "prototype",
+        "productionBackend": "fuse",
+        "arbitraryVirtualPaths": {
+            "required": True,
+            "ready": False,
+            "backend": "fuse",
+            "note": "MacBox production sandboxing requires a mounted overlay filesystem; workspace-only backends are not the mainline.",
+        },
+        "macfuse": macfuse,
+        "homebrew": {
+            "available": shutil.which("brew") is not None,
+            "path": shutil.which("brew"),
+        },
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "macVersion": platform.mac_ver()[0],
+        },
+    }
+
+
+def backend_install_plan(backend: str = "macfuse", use_brew: bool = False) -> dict:
+    if backend != "macfuse":
+        raise SystemExit(f"unsupported backend installer: {backend}")
+    brew = shutil.which("brew")
+    steps: list[dict[str, str]] = []
+    if use_brew and brew:
+        steps.append({
+            "type": "command",
+            "command": f"{brew} install --cask macfuse",
+            "note": "Runs the macFUSE cask installer. macOS may ask for administrator approval and a reboot.",
+        })
+    else:
+        steps.append({
+            "type": "open",
+            "url": "https://macfuse.github.io/",
+            "note": "Download and run the official macFUSE installer. Approve the system extension when macOS asks.",
+        })
+        if brew:
+            steps.append({
+                "type": "optional-command",
+                "command": f"{brew} install --cask macfuse",
+                "note": "Alternative Homebrew install path. Use --use-brew --execute to run it from MacBox.",
+            })
+    steps.append({
+        "type": "verify",
+        "command": "./macbox backend doctor",
+        "note": "Re-run after installation to confirm macFUSE is visible to MacBox.",
+    })
+    return {
+        "backend": backend,
+        "backendReady": False,
+        "macfuseInstalled": macfuse_status()["available"],
+        "requiresAdminApproval": True,
+        "requiresSystemExtensionApproval": True,
+        "guideUrl": "https://macfuse.github.io/",
+        "steps": steps,
+    }
+
+
+def backend_doctor_report() -> dict:
+    status = backend_status()
+    macfuse = status["macfuse"]
+    checks = [
+        {
+            "id": "arbitrary-virtual-paths",
+            "ok": False,
+            "severity": "blocking",
+            "message": "Production arbitrary-path virtual writes require the mounted overlay backend.",
+        },
+        {
+            "id": "macfuse-installed",
+            "ok": bool(macfuse["available"]),
+            "severity": "blocking",
+            "message": "macFUSE is installed" if macfuse["available"] else "macFUSE is not installed or not visible.",
+        },
+        {
+            "id": "macfuse-mount-command",
+            "ok": bool(macfuse["mountCommand"]),
+            "severity": "blocking",
+            "message": f"mount command: {macfuse['mountCommand']}" if macfuse["mountCommand"] else "mount_macfuse/mount_osxfuse not found in PATH.",
+        },
+        {
+            "id": "python-fuse-binding",
+            "ok": bool(macfuse["pythonBinding"]),
+            "severity": "blocking",
+            "message": "Python FUSE binding is available" if macfuse["pythonBinding"] else "Python FUSE binding is not available in this interpreter.",
+        },
+        {
+            "id": "homebrew",
+            "ok": bool(status["homebrew"]["available"]),
+            "severity": "info",
+            "message": f"Homebrew: {status['homebrew']['path']}" if status["homebrew"]["available"] else "Homebrew not found; official installer flow is still supported.",
+        },
+    ]
+    blocking = [check for check in checks if check["severity"] == "blocking" and not check["ok"]]
+    next_actions: list[str] = []
+    if any(check["id"] in ("macfuse-installed", "macfuse-mount-command") for check in blocking):
+        next_actions.append("Install macFUSE with './macbox backend install --backend macfuse --open' or '--use-brew --execute'.")
+    if any(check["id"] == "python-fuse-binding" for check in blocking):
+        next_actions.append("Install a Python FUSE binding for the interpreter that runs MacBox.")
+    if any(check["id"] == "arbitrary-virtual-paths" for check in blocking):
+        next_actions.append("Implement and verify the mounted overlay filesystem backend.")
+    if not next_actions:
+        next_actions.append("Backend dependencies are present; continue mounted overlay verification.")
+    return {
+        "ready": not blocking,
+        "checks": checks,
+        "status": status,
+        "nextActions": next_actions,
+        "nextAction": " ".join(next_actions),
+        "installPlan": backend_install_plan("macfuse"),
     }
 
 
@@ -1032,6 +1151,83 @@ def cmd_fuse_status(args: argparse.Namespace) -> int:
     return 0 if status["available"] else 2
 
 
+def print_backend_status_text(status: dict) -> None:
+    macfuse = status["macfuse"]
+    virtual = status["arbitraryVirtualPaths"]
+    print(f"default backend: {status['defaultBackend']}")
+    print(f"production backend: {status['productionBackend']}")
+    print(f"arbitrary virtual paths: {'ready' if virtual['ready'] else 'not ready'}")
+    print(f"macFUSE: {'available' if macfuse['available'] else 'unavailable'}")
+    print(f"mount command: {macfuse['mountCommand'] or '-'}")
+    print(f"python binding: {'yes' if macfuse['pythonBinding'] else 'no'}")
+    print(f"homebrew: {status['homebrew']['path'] or '-'}")
+
+
+def cmd_backend_status(args: argparse.Namespace) -> int:
+    status = backend_status()
+    if args.json:
+        print(json.dumps(status, indent=2))
+    else:
+        print_backend_status_text(status)
+    return 0
+
+
+def cmd_backend_doctor(args: argparse.Namespace) -> int:
+    report = backend_doctor_report()
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0 if report["ready"] else 2
+    print(f"backend ready: {'yes' if report['ready'] else 'no'}")
+    for check in report["checks"]:
+        marker = "ok" if check["ok"] else "missing"
+        print(f"{marker:7} {check['id']}: {check['message']}")
+    print(f"next: {report['nextAction']}")
+    return 0 if report["ready"] else 2
+
+
+def print_install_plan(plan: dict) -> None:
+    print(f"backend: {plan['backend']}")
+    print(f"backend ready: {'yes' if plan['backendReady'] else 'no'}")
+    print(f"macFUSE currently installed: {'yes' if plan['macfuseInstalled'] else 'no'}")
+    print("installation requires macOS administrator/system extension approval.")
+    for idx, step in enumerate(plan["steps"], start=1):
+        action = step.get("command") or step.get("url", "")
+        print(f"{idx}. {step['type']}: {action}")
+        print(f"   {step['note']}")
+
+
+def cmd_backend_install(args: argparse.Namespace) -> int:
+    if args.open and args.execute:
+        raise SystemExit("--open and --execute cannot be used together")
+    if args.json and (args.open or args.execute):
+        raise SystemExit("--json cannot be combined with --open or --execute")
+    plan = backend_install_plan(args.backend, use_brew=args.use_brew)
+    if args.json:
+        print(json.dumps(plan, indent=2))
+        return 0
+    if args.dry_run or not (args.open or args.execute):
+        print_install_plan(plan)
+        if not args.dry_run:
+            print("no action taken; pass --open or --execute to start the guided install.")
+        return 0
+    if args.open:
+        subprocess.run(["open", plan["guideUrl"]], check=False)
+        print(f"opened installer guide: {plan['guideUrl']}")
+        return 0
+    if args.execute:
+        if args.backend != "macfuse":
+            raise SystemExit(f"unsupported backend installer: {args.backend}")
+        brew = shutil.which("brew")
+        if not args.use_brew:
+            raise SystemExit("--execute currently requires --use-brew so the command is explicit")
+        if not brew:
+            raise SystemExit("Homebrew is not available; use --open for the official installer flow")
+        command = [brew, "install", "--cask", "macfuse"]
+        print("+ " + " ".join(shlex.quote(part) for part in command))
+        return subprocess.run(command).returncode
+    return 0
+
+
 def cmd_mount(args: argparse.Namespace) -> int:
     if args.backend != "fuse":
         raise SystemExit(f"unsupported backend for mount: {args.backend}")
@@ -1105,6 +1301,26 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("fuse-status", help="show macFUSE availability for the future fuse backend")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_fuse_status)
+
+    p = sub.add_parser("backend", help="manage production backend dependencies")
+    backend_sub = p.add_subparsers(dest="backend_cmd", required=True)
+
+    bp = backend_sub.add_parser("status", help="show backend dependency status")
+    bp.add_argument("--json", action="store_true")
+    bp.set_defaults(func=cmd_backend_status)
+
+    bp = backend_sub.add_parser("doctor", help="run backend readiness checks")
+    bp.add_argument("--json", action="store_true")
+    bp.set_defaults(func=cmd_backend_doctor)
+
+    bp = backend_sub.add_parser("install", help="show or start guided backend installation")
+    bp.add_argument("--backend", default="macfuse", choices=["macfuse"])
+    bp.add_argument("--use-brew", action="store_true", help="prefer the Homebrew cask install plan")
+    bp.add_argument("--dry-run", action="store_true", help="print the plan and do not open or execute anything")
+    bp.add_argument("--open", action="store_true", help="open the official installer guide")
+    bp.add_argument("--execute", action="store_true", help="run the explicit install command when available")
+    bp.add_argument("--json", action="store_true")
+    bp.set_defaults(func=cmd_backend_install)
 
     p = sub.add_parser("mount", help="mount a sandbox backend")
     p.add_argument("--backend", default="fuse", choices=["fuse"])
