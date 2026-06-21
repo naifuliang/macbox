@@ -158,7 +158,12 @@ Acceptance:
 - Writes through the virtual root land in overlay, not on the real disk.
 - `mkdir`, `touch`, `rm`, `mv`, `cp`, and shell redirection work without shell
   wrappers.
-- `changes` accurately reports writes, deletes, and renames.
+- `changes` reports writes and deletes; renames are represented as a staged
+  write at the new path plus a tombstone at the old path until an explicit
+  rename change type is added.
+- `scripts/verify-fuse-overlay-writes.sh` validates overlay write operations on
+  all hosts; when macFUSE and the Python binding are present, it also performs
+  a real mount/write/change-report/unmount check.
 
 ### Phase 6: Session Execution From Virtual Root
 
