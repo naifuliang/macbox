@@ -42,6 +42,10 @@ def interpose_library_path() -> Path:
     return project_root() / ".macbox" / "libmacbox_interpose.dylib"
 
 
+def mount_record_path(name: str) -> Path:
+    return sandbox_root(name) / "mount.json"
+
+
 def rcfile_path(name: str) -> Path:
     return sandbox_root(name) / "shellrc"
 
@@ -87,6 +91,25 @@ def should_virtualize_path(path: str) -> bool:
     if "://" in path:
         return False
     return True
+
+
+def macfuse_status() -> dict:
+    filesystem = Path("/Library/Filesystems/macfuse.fs")
+    framework = Path("/Library/Frameworks/macFUSE.framework")
+    mount_command = shutil.which("mount_macfuse") or shutil.which("mount_osxfuse")
+    try:
+        __import__("fuse")
+        python_binding = True
+    except Exception:
+        python_binding = False
+    available = filesystem.exists() or framework.exists() or bool(mount_command)
+    return {
+        "available": available,
+        "filesystem": str(filesystem) if filesystem.exists() else None,
+        "framework": str(framework) if framework.exists() else None,
+        "mountCommand": mount_command,
+        "pythonBinding": python_binding,
+    }
 
 
 def read_config(name: str) -> dict[str, list[str]]:
@@ -625,8 +648,121 @@ class PrototypeBackend(SandboxBackend):
         return real
 
 
+class FuseBackend(SandboxBackend):
+    name = "fuse"
+
+    def status(self) -> dict:
+        return macfuse_status()
+
+    def require_available(self) -> dict:
+        status = self.status()
+        if not status["available"]:
+            raise SystemExit(
+                "macFUSE is not available. Install macFUSE before using the fuse backend: "
+                "https://macfuse.github.io/"
+            )
+        if not status["pythonBinding"]:
+            raise SystemExit(
+                "macFUSE appears to be installed, but the Python FUSE binding is unavailable. "
+                "The read-only mount implementation is disabled in this build."
+            )
+        return status
+
+    def create(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None, plain: bool = False) -> str:
+        if plain:
+            raise SystemExit("plain sessions do not use the fuse backend")
+        self.ensure(name, reads, writes)
+        return name
+
+    def ensure(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> None:
+        root = sandbox_root(name)
+        for sub in ("overlay", "tmp", "home", "cache", "mounts"):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        if not config_path(name).exists() or reads is not None or writes is not None:
+            write_config(name, reads or [], writes or ["/"])
+        cfg = read_config(name)
+        write_metadata(
+            name,
+            backend=self.name,
+            sandboxed=True,
+            status=read_metadata(name).get("status", "idle"),
+            readRoots=cfg["read"],
+            writeRoots=cfg["write"],
+            overlayPath=str(overlay_root(name)),
+            mountPath=read_metadata(name).get("mountPath"),
+        )
+
+    def mount_readonly(self, name: str, mount_path: str, reads: list[str] | None = None, writes: list[str] | None = None) -> Path:
+        self.require_available()
+        self.ensure(name, reads, writes)
+        mount = normalize_abs(mount_path)
+        mount.mkdir(parents=True, exist_ok=True)
+        raise SystemExit(
+            "macFUSE is available, but MacBox read-only FUSE mounting is not implemented in this build yet. "
+            f"Prepared mount directory: {mount}"
+        )
+
+    def unmount(self, name: str) -> None:
+        data = read_metadata(name)
+        mount = data.get("mountPath")
+        if not mount:
+            print(f"no recorded mount for session: {name}")
+            return
+        subprocess.run(["/sbin/umount", mount], check=False)
+        write_metadata(name, mountPath=None)
+
+    def real_to_virtual(self, name: str, real_path: str) -> Path:
+        data = read_metadata(name)
+        mount = data.get("mountPath")
+        if not mount:
+            raise SystemExit(f"fuse session is not mounted: {name}")
+        real = normalize_abs(real_path)
+        return Path(mount) / str(real).lstrip("/")
+
+    def prepare_virtual_path(self, name: str, real_path: str, mkdir: bool = False, directory: bool = False) -> Path:
+        path = self.real_to_virtual(name, real_path)
+        if mkdir:
+            target = path if directory else path.parent
+            target.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def prepare_shell(self, name: str, command: list[str], stdin_data: str | None = None) -> "LaunchSpec":
+        raise SystemExit("fuse backend shell launch requires a mounted session")
+
+    def prepare_app(self, name: str, executable: Path, args: list[str]) -> "LaunchSpec":
+        raise SystemExit("fuse backend app launch requires a mounted session")
+
+    def open_terminal_command(self, name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> str:
+        raise SystemExit("fuse backend terminal launch requires a mounted session")
+
+    def list_changes(self, name: str) -> list[dict]:
+        return collect_changes(name)
+
+    def list_sessions(self) -> list[dict]:
+        return collect_sessions()
+
+    def environment(self, name: str) -> dict[str, str]:
+        return os.environ.copy()
+
+    def rewrite_line(self, name: str, line: str) -> str:
+        return line
+
+    def apply(self, name: str, clear: bool = False) -> tuple[int, Path | None]:
+        return PrototypeBackend().apply(name, clear)
+
+    def discard(self, name: str) -> None:
+        PrototypeBackend().discard(name)
+
+    def mark_delete(self, name: str, real_path: str) -> Path:
+        return PrototypeBackend().mark_delete(name, real_path)
+
+
 def sandbox_backend() -> SandboxBackend:
     return PrototypeBackend()
+
+
+def fuse_backend() -> FuseBackend:
+    return FuseBackend()
 
 
 @dataclass
@@ -882,6 +1018,33 @@ def cmd_rewrite(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fuse_status(args: argparse.Namespace) -> int:
+    status = fuse_backend().status()
+    if args.json:
+        print(json.dumps(status, indent=2))
+    else:
+        label = "available" if status["available"] else "unavailable"
+        print(f"macFUSE: {label}")
+        print(f"filesystem: {status['filesystem'] or '-'}")
+        print(f"framework: {status['framework'] or '-'}")
+        print(f"mount command: {status['mountCommand'] or '-'}")
+        print(f"python binding: {'yes' if status['pythonBinding'] else 'no'}")
+    return 0 if status["available"] else 2
+
+
+def cmd_mount(args: argparse.Namespace) -> int:
+    if args.backend != "fuse":
+        raise SystemExit(f"unsupported backend for mount: {args.backend}")
+    mount = fuse_backend().mount_readonly(args.name, args.mount, args.read, args.write)
+    print(f"mounted {args.name}: {mount}")
+    return 0
+
+
+def cmd_unmount(args: argparse.Namespace) -> int:
+    fuse_backend().unmount(args.name)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MacBox: a small macOS sandbox runner with explicit apply.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -938,6 +1101,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", default="default")
     p.add_argument("line")
     p.set_defaults(func=cmd_rewrite)
+
+    p = sub.add_parser("fuse-status", help="show macFUSE availability for the future fuse backend")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_fuse_status)
+
+    p = sub.add_parser("mount", help="mount a sandbox backend")
+    p.add_argument("--backend", default="fuse", choices=["fuse"])
+    p.add_argument("--name", default="default")
+    p.add_argument("--mount", required=True, help="mount point path")
+    p.add_argument("--read", action="append", default=None)
+    p.add_argument("--write", action="append", default=None)
+    p.set_defaults(func=cmd_mount)
+
+    p = sub.add_parser("unmount", help="unmount a sandbox backend")
+    p.add_argument("--name", default="default")
+    p.set_defaults(func=cmd_unmount)
 
     p = sub.add_parser("changes", help="list pending virtual writes")
     p.add_argument("--name", default="default")
