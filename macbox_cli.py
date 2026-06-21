@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import datetime as _dt
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -27,6 +31,14 @@ def overlay_root(name: str) -> Path:
 
 def profile_path(name: str) -> Path:
     return sandbox_root(name) / "profile.sb"
+
+
+def interpose_source_path() -> Path:
+    return project_root() / "macbox_interpose.c"
+
+
+def interpose_library_path() -> Path:
+    return project_root() / ".macbox" / "libmacbox_interpose.dylib"
 
 
 def rcfile_path(name: str) -> Path:
@@ -64,6 +76,16 @@ def virtual_path(name: str, real_path: str) -> Path:
     real = normalize_abs(real_path)
     rel = str(real).lstrip("/")
     return overlay_root(name) / rel
+
+
+def should_virtualize_path(path: str) -> bool:
+    if not path:
+        return False
+    if path.startswith("-"):
+        return False
+    if "://" in path:
+        return False
+    return True
 
 
 def read_config(name: str) -> dict[str, list[str]]:
@@ -125,6 +147,7 @@ def path_allowed(path: Path, allowed_roots: list[str]) -> bool:
 
 
 def sandbox_profile(name: str) -> str:
+    session = sandbox_root(name).resolve(strict=False)
     overlay = overlay_root(name).resolve(strict=False)
     temp = sandbox_root(name).resolve(strict=False) / "tmp"
     home = sandbox_root(name).resolve(strict=False) / "home"
@@ -135,14 +158,52 @@ def sandbox_profile(name: str) -> str:
         '',
         '; Real disk is readable by default, but writes are blocked.',
         '; Writes are allowed only inside the MacBox overlay and process temp dirs.',
-        '(deny file-write*',
+        f'(allow file-write* (subpath "{quote_sb(session)}"))',
+        f'(allow file-write* (subpath "{quote_sb(overlay)}"))',
+        f'(allow file-write* (subpath "{quote_sb(temp)}"))',
+        f'(allow file-write* (subpath "{quote_sb(home)}"))',
+        f'(allow file-write* (subpath "{quote_sb(cache)}"))',
+        '(allow file-write* (subpath "/dev"))',
+        '(deny file-write* (require-all',
+        f'  (require-not (subpath "{quote_sb(session)}"))',
         f'  (require-not (subpath "{quote_sb(overlay)}"))',
         f'  (require-not (subpath "{quote_sb(temp)}"))',
         f'  (require-not (subpath "{quote_sb(home)}"))',
         f'  (require-not (subpath "{quote_sb(cache)}"))',
-        '  (require-not (subpath "/dev")))',
+        '  (require-not (subpath "/dev"))))',
     ]
     return "\n".join(lines) + "\n"
+
+
+def ensure_interpose_library() -> Path | None:
+    src = interpose_source_path()
+    dst = interpose_library_path()
+    if not src.exists():
+        return None
+    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "clang",
+        "-dynamiclib",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-arch",
+        "arm64",
+        "-arch",
+        "arm64e",
+        "-o",
+        str(dst),
+        str(src),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        message = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
+        print(f"warning: transparent path mapping disabled; failed to build interpose library: {message}", file=sys.stderr)
+        return None
+    return dst
 
 
 def ensure_sandbox(name: str, reads: list[str] | None = None, writes: list[str] | None = None) -> None:
@@ -165,26 +226,220 @@ def ensure_sandbox(name: str, reads: list[str] | None = None, writes: list[str] 
     )
 
 
+def sandbox_environment(name: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update({
+        "MACBOX_NAME": name,
+        "MB_ROOT": str(overlay_root(name)),
+        "TMPDIR": str(sandbox_root(name) / "tmp"),
+        "HOME": str(sandbox_root(name) / "home"),
+        "XDG_CACHE_HOME": str(sandbox_root(name) / "cache"),
+        "MACBOX_SANDBOX": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "SHELL_SESSIONS_DISABLE": "1",
+    })
+    dylib = ensure_interpose_library()
+    if dylib:
+        existing = env.get("DYLD_INSERT_LIBRARIES")
+        env["DYLD_INSERT_LIBRARIES"] = str(dylib) if not existing else f"{dylib}:{existing}"
+        env["DYLD_FORCE_FLAT_NAMESPACE"] = "1"
+        env["MACBOX_TRANSPARENT_OVERLAY"] = "1"
+    return env
+
+
 def shell_rc(name: str) -> str:
     exe = project_root() / "macbox"
+    py = quote_sb(sys.executable)
+    cli = quote_sb(project_root() / "macbox_cli.py")
+    macbox_cmd = f'"{py}" "{cli}"'
     return f"""export MACBOX_NAME="{name}"
 export MB_ROOT="{overlay_root(name)}"
 export TMPDIR="{sandbox_root(name) / 'tmp'}"
 export HOME="{sandbox_root(name) / 'home'}"
 export XDG_CACHE_HOME="{sandbox_root(name) / 'cache'}"
 export MACBOX_SANDBOX=1
+export PYTHONDONTWRITEBYTECODE=1
+export SHELL_SESSIONS_DISABLE=1
 unset HISTFILE
 export SAVEHIST=0
 export PS1="macbox:{name} \\w $ "
 export PROMPT="%F{{cyan}}macbox:{name}%f %1~ %# "
-alias mb-changes='{exe} changes --name "{name}"'
-alias mb-apply='{exe} apply --name "{name}"'
-alias mb-delete='{exe} delete --name "{name}"'
-vpath() {{ "{exe}" path --name "{name}" --mkdir "$@"; }}
+alias mb-changes='{macbox_cmd} changes --name "{name}"'
+alias mb-apply='{macbox_cmd} apply --name "{name}"'
+alias mb-delete='{macbox_cmd} delete --name "{name}"'
+vpath() {{ {macbox_cmd} path --name "{name}" --mkdir "$@"; }}
+_macbox_path() {{ {macbox_cmd} path --name "{name}" --mkdir "$@"; }}
+_macbox_dir_path() {{ {macbox_cmd} path --name "{name}" --mkdir "$@"; }}
+mkdir() {{
+  local args=()
+  local paths=()
+  local expect_value=0
+  for arg in "$@"; do
+    if (( expect_value )); then
+      args+=("$arg")
+      expect_value=0
+    elif [[ "$arg" == "--" ]]; then
+      args+=("$arg")
+    elif [[ "$arg" == "-m" ]]; then
+      args+=("$arg")
+      expect_value=1
+    elif [[ "$arg" == -* ]]; then
+      args+=("$arg")
+    else
+      paths+=("$(_macbox_dir_path "$arg")")
+    fi
+  done
+  command mkdir "${{args[@]}}" "${{paths[@]}}"
+}}
+touch() {{
+  local args=()
+  local paths=()
+  for arg in "$@"; do
+    if [[ "$arg" == -* ]]; then
+      args+=("$arg")
+    else
+      paths+=("$(_macbox_path "$arg")")
+    fi
+  done
+  command touch "${{args[@]}}" "${{paths[@]}}"
+}}
+cat() {{
+  local args=()
+  local paths=()
+  for arg in "$@"; do
+    if [[ "$arg" == -* ]]; then
+      args+=("$arg")
+    else
+      local mapped="$({macbox_cmd} path --name "{name}" "$arg")"
+      if [[ -e "$mapped" ]]; then
+        paths+=("$mapped")
+      else
+        paths+=("$arg")
+      fi
+    fi
+  done
+  command cat "${{args[@]}}" "${{paths[@]}}"
+}}
+macbox-rewrite-line() {{
+  BUFFER=$({macbox_cmd} rewrite --name "{name}" -- "$BUFFER")
+  zle accept-line
+}}
+zle -N macbox-rewrite-line
+bindkey '^M' macbox-rewrite-line
+bindkey '^J' macbox-rewrite-line
 echo "MacBox sandbox: {name}"
-echo "Real disk is readable. Write virtual files under: $MB_ROOT"
-echo "Use: vpath /real/path  |  mb-changes  |  mb-apply"
+echo "Real disk is readable. Writes are redirected into: $MB_ROOT"
+echo "Use: mb-changes  |  mb-apply  |  vpath /real/path"
 """
+
+
+def rewrite_shell_line(name: str, line: str) -> str:
+    def mapped_path(path: str) -> str:
+        mapped = virtual_path(name, path.replace(r"\ ", " "))
+        return str(mapped)
+
+    result: list[str] = []
+    mkdir_parents: list[str] = []
+
+    def note_parent(path: str) -> None:
+        parent = str(Path(path).parent)
+        if parent not in mkdir_parents:
+            mkdir_parents.append(parent)
+
+    i = 0
+    quote: str | None = None
+    while i < len(line):
+        char = line[i]
+        if quote:
+            result.append(char)
+            if char == quote:
+                quote = None
+            elif char == "\\" and i + 1 < len(line):
+                i += 1
+                result.append(line[i])
+            i += 1
+            continue
+
+        if char in ("'", '"'):
+            quote = char
+            result.append(char)
+            i += 1
+            continue
+
+        op_start = i
+        if char.isdigit():
+            j = i
+            while j < len(line) and line[j].isdigit():
+                j += 1
+            if j < len(line) and line[j] in ("<", ">"):
+                i = j
+            else:
+                result.append(char)
+                i += 1
+                continue
+        elif char == "&" and line.startswith("&>>", i):
+            i += 1
+        elif char not in ("<", ">"):
+            result.append(char)
+            i += 1
+            continue
+
+        if line.startswith(">>", i):
+            i += 2
+        elif i < len(line) and line[i] in ("<", ">"):
+            i += 1
+        else:
+            result.append(line[op_start])
+            i = op_start + 1
+            continue
+
+        op_text = line[op_start:i]
+        is_write_redirect = ">" in op_text
+        result.append(op_text)
+        while i < len(line) and line[i].isspace():
+            result.append(line[i])
+            i += 1
+
+        if i >= len(line):
+            continue
+
+        if line[i] in ("'", '"'):
+            path_quote = line[i]
+            path_start = i + 1
+            j = path_start
+            while j < len(line) and line[j] != path_quote:
+                if line[j] == "\\" and j + 1 < len(line):
+                    j += 2
+                else:
+                    j += 1
+            path = line[path_start:j]
+            if should_virtualize_path(path):
+                mapped = mapped_path(path)
+                if is_write_redirect:
+                    note_parent(mapped)
+                result.append(f'"{mapped}"')
+            else:
+                result.append(line[i:j + 1])
+            i = min(j + 1, len(line))
+            continue
+
+        path_start = i
+        while i < len(line) and not line[i].isspace() and line[i] not in ";&|<>":
+            i += 1
+        path = line[path_start:i]
+        if should_virtualize_path(path):
+            mapped = mapped_path(path)
+            if is_write_redirect:
+                note_parent(mapped)
+            result.append(f'"{mapped}"')
+        else:
+            result.append(path)
+
+    rewritten = "".join(result)
+    if mkdir_parents:
+        parents = " ".join(shlex.quote(parent) for parent in mkdir_parents)
+        return f"command mkdir -p -- {parents}; {rewritten}"
+    return rewritten
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -223,25 +478,34 @@ def cmd_run(args: argparse.Namespace) -> int:
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
+    rewritten_stdin = None
     if not command:
         shell = os.environ.get("SHELL", "/bin/zsh")
         command = [shell, "-i"]
         if Path(shell).name in ("bash", "zsh"):
             command = [shell, "-i"] if Path(shell).name == "zsh" else [shell, "--rcfile", str(rcfile_path(args.name)), "-i"]
-    env = os.environ.copy()
-    env.update({
-        "MACBOX_NAME": args.name,
-        "MB_ROOT": str(overlay_root(args.name)),
-        "TMPDIR": str(sandbox_root(args.name) / "tmp"),
-        "HOME": str(sandbox_root(args.name) / "home"),
-        "XDG_CACHE_HOME": str(sandbox_root(args.name) / "cache"),
-    })
+        if not sys.stdin.isatty():
+            stdin_data = sys.stdin.read()
+            lines = stdin_data.splitlines(keepends=True)
+            rewritten_stdin = "".join(
+                rewrite_shell_line(args.name, line.removesuffix("\n").removesuffix("\r")) + ("\n" if line.endswith("\n") else "")
+                for line in lines
+            )
+    elif len(command) >= 3 and Path(command[0]).name == "zsh" and command[1] == "-lc":
+        command = [command[0], command[1], rewrite_shell_line(args.name, command[2]), *command[3:]]
+    env = sandbox_environment(args.name)
     if not args.command and Path(env.get("SHELL", "/bin/zsh")).name == "zsh":
-        env["ZDOTDIR"] = str(sandbox_root(args.name))
-        (sandbox_root(args.name) / ".zshrc").write_text(rcfile_path(args.name).read_text())
+        zhome = sandbox_root(args.name) / "home"
+        env["ZDOTDIR"] = str(zhome)
+        (zhome / ".zshrc").write_text(rcfile_path(args.name).read_text())
     write_metadata(args.name, status="running", lastCommand=" ".join(command), pid=os.getpid())
     try:
-        proc = subprocess.run(["sandbox-exec", "-f", str(profile_path(args.name)), *command], env=env)
+        proc = subprocess.run(
+            ["sandbox-exec", "-f", str(profile_path(args.name)), *command],
+            env=env,
+            input=rewritten_stdin,
+            text=rewritten_stdin is not None,
+        )
         return proc.returncode
     finally:
         write_metadata(args.name, status="idle", pid=None, lastExitedAt=now_iso())
@@ -285,13 +549,7 @@ def cmd_run_app(args: argparse.Namespace) -> int:
     ensure_sandbox(args.name, args.read, args.write)
     app = normalize_abs(args.app)
     exe = find_app_executable(app)
-    env = os.environ.copy()
-    env.update({
-        "MACBOX_NAME": args.name,
-        "MB_ROOT": str(overlay_root(args.name)),
-        "TMPDIR": str(sandbox_root(args.name) / "tmp"),
-        "HOME": str(sandbox_root(args.name) / "home"),
-    })
+    env = sandbox_environment(args.name)
     print(f"starting {app} via {exe}")
     proc = subprocess.run(["sandbox-exec", "-f", str(profile_path(args.name)), str(exe), *args.args], env=env)
     return proc.returncode
@@ -305,6 +563,8 @@ def iter_overlay_entries(name: str):
         rel = path.relative_to(root)
         if ".DS_Store" in rel.parts:
             continue
+        if path.is_dir() and not path.is_symlink() and any(path.iterdir()):
+            continue
         yield path, Path("/") / rel
 
 
@@ -312,8 +572,6 @@ def collect_changes(name: str) -> list[dict]:
     ensure_sandbox(name)
     changes = []
     for overlay, real in iter_overlay_entries(name):
-        if overlay.is_dir() and not overlay.is_symlink() and any(overlay.iterdir()):
-            continue
         kind = "dir" if overlay.is_dir() else "file"
         if overlay.is_symlink():
             kind = "symlink"
@@ -485,6 +743,11 @@ def cmd_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rewrite(args: argparse.Namespace) -> int:
+    print(rewrite_shell_line(args.name, args.line))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MacBox: a small macOS sandbox runner with explicit apply.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -536,6 +799,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--directory", action="store_true")
     p.add_argument("real_path")
     p.set_defaults(func=cmd_path)
+
+    p = sub.add_parser("rewrite", help=argparse.SUPPRESS)
+    p.add_argument("--name", default="default")
+    p.add_argument("line")
+    p.set_defaults(func=cmd_rewrite)
 
     p = sub.add_parser("changes", help="list pending virtual writes")
     p.add_argument("--name", default="default")

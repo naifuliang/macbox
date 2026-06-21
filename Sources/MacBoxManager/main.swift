@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 
 struct Session: Identifiable, Decodable, Equatable {
@@ -26,6 +27,13 @@ struct FileChange: Identifiable, Decodable, Equatable {
     var fileName: String { URL(fileURLWithPath: realPath).lastPathComponent }
 }
 
+struct TerminalLaunch {
+    let executable: URL
+    let arguments: [String]
+    let currentDirectory: URL
+    let environment: [String: String]
+}
+
 @MainActor
 final class MacBoxStore: ObservableObject {
     @Published var allSessions: [Session] = []
@@ -49,6 +57,29 @@ final class MacBoxStore: ObservableObject {
 
     private var cli: URL {
         root.appendingPathComponent("macbox")
+    }
+
+    func terminalLaunch(for session: Session) -> TerminalLaunch {
+        var env = ProcessInfo.processInfo.environment
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
+
+        if session.isSandboxed {
+            return TerminalLaunch(
+                executable: cli,
+                arguments: ["session", "--name", session.name],
+                currentDirectory: root,
+                environment: env
+            )
+        }
+
+        let shell = env["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"
+        return TerminalLaunch(
+            executable: URL(fileURLWithPath: shell),
+            arguments: ["-l"],
+            currentDirectory: root,
+            environment: env
+        )
     }
 
     func refresh() {
@@ -456,6 +487,7 @@ struct SessionTab: View {
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .stroke(selected ? .white.opacity(0.08) : .black.opacity(0.22), lineWidth: 1)
         )
+        .contentShape(Rectangle())
         .onHover { inside in
             withAnimation(.easeInOut(duration: 0.12)) {
                 hovering = inside
@@ -507,7 +539,7 @@ struct TerminalLayout: View {
         Group {
             switch layoutMode {
             case .single:
-                pane(for: panes.first ?? fallbackSession)
+                pane(for: fallbackSession)
             case .twoColumns:
                 HStack(spacing: 1) {
                     ForEach(panes) { session in
@@ -575,50 +607,19 @@ struct EmptyPane: View {
 struct TerminalSurface: View {
     @ObservedObject var store: MacBoxStore
     let session: Session
-    @State private var lines: [String] = []
-    @State private var command = ""
-    @FocusState private var commandFocused: Bool
 
     var body: some View {
-        ZStack {
-            Color.black
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(Array(initialLines.enumerated()), id: \.offset) { _, line in
-                            terminalLine(line.text, dim: line.dim)
-                        }
-                        ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                            terminalLine(line, dim: false)
-                        }
-                        promptLine
-                            .id("prompt")
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 14)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                }
-                .onChange(of: lines.count) { _, _ in
-                    proxy.scrollTo("prompt", anchor: .bottom)
-                }
-            }
-        }
+        TerminalPTYView(
+            launch: store.terminalLaunch(for: session),
+            banner: banner
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .font(.system(size: 16, weight: .semibold, design: .monospaced))
-        .contentShape(Rectangle())
-        .onTapGesture {
-            commandFocused = true
-        }
-        .onAppear {
-            commandFocused = true
-        }
     }
 
-    private var initialLines: [(text: String, dim: Bool)] {
+    private var banner: String {
         var base: [(String, Bool)] = [
             ("MacBox Terminal 0.1.0", false),
-            ("Type 'help' to get help.", true),
+            ("Interactive PTY session. Type commands directly.", true),
             ("", true),
             ("Session: \(session.name)  ·  \(session.isSandboxed ? "sandbox" : "session")", true)
         ]
@@ -629,60 +630,243 @@ struct TerminalSurface: View {
             base.append(("Session ready.", false))
         }
         base.append(("", true))
-        return base
+        return base.map(\.0).joined(separator: "\n") + "\n"
+    }
+}
+
+struct TerminalPTYView: NSViewRepresentable {
+    let launch: TerminalLaunch
+    let banner: String
+
+    func makeNSView(context: Context) -> TerminalPTYTextView {
+        let view = TerminalPTYTextView()
+        view.configure(launch: launch, banner: banner)
+        return view
     }
 
-    private func terminalLine(_ text: String, dim: Bool) -> some View {
-        Text(text)
-            .foregroundStyle(dim ? .white.opacity(0.74) : .white)
-            .textSelection(.enabled)
+    func updateNSView(_ nsView: TerminalPTYTextView, context: Context) {
+        nsView.focusIfNeeded()
+    }
+}
+
+final class TerminalPTYTextView: NSScrollView {
+    private let textView = TerminalTextView()
+    private var process: Process?
+    private var masterFile: FileHandle?
+    private var masterFD: Int32 = -1
+    private var slaveFD: Int32 = -1
+    private var configured = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        drawsBackground = true
+        backgroundColor = .black
+        borderType = .noBorder
+        hasVerticalScroller = true
+        autohidesScrollers = true
+
+        textView.minSize = .zero
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = false
+        textView.drawsBackground = true
+        textView.backgroundColor = .black
+        textView.textColor = .white
+        textView.insertionPointColor = .white
+        textView.font = .monospacedSystemFont(ofSize: 16, weight: .semibold)
+        textView.isEditable = false
+        textView.isSelectable = true
+        documentView = textView
     }
 
-    private var promptLine: some View {
-        HStack(spacing: 8) {
-            Text("naifu@MacBox")
-                .foregroundStyle(.white)
-            Text("~")
-                .padding(.horizontal, 9)
-                .padding(.vertical, 2)
-                .background(Color(red: 0.02, green: 0.16, blue: 0.42))
-                .clipShape(RoundedRectangle(cornerRadius: 2))
-            if session.isSandboxed {
-                Text("sandbox")
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 2)
-                    .background(Color(red: 0.75, green: 0.62, blue: 0.03))
-                    .foregroundStyle(.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 2))
-            }
-            Text("%")
-                .foregroundStyle(.cyan)
-            TextField("", text: $command)
-                .textFieldStyle(.plain)
-                .focused($commandFocused)
-                .foregroundStyle(.white)
-                .font(.system(size: 16, weight: .semibold, design: .monospaced))
-                .onSubmit {
-                    submitCommand()
-                }
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        masterFile?.readabilityHandler = nil
+        if let process, process.isRunning {
+            process.terminate()
         }
-        .textSelection(.enabled)
     }
 
-    private func submitCommand() {
-        let submitted = command
-        command = ""
-        let trimmed = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        if trimmed == "clear" {
-            lines.removeAll()
+    func configure(launch: TerminalLaunch, banner: String) {
+        guard !configured else { return }
+        configured = true
+        append(banner)
+        startProcess(launch: launch)
+    }
+
+    func focusIfNeeded() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.window?.firstResponder !== self.textView else { return }
+            self.window?.makeFirstResponder(self.textView)
+        }
+    }
+
+    private func startProcess(launch: TerminalLaunch) {
+        var term = termios()
+        tcgetattr(STDIN_FILENO, &term)
+        var size = winsize()
+        size.ws_row = 40
+        size.ws_col = 120
+
+        guard openpty(&masterFD, &slaveFD, nil, &term, &size) == 0 else {
+            append("Failed to create pty: \(String(cString: strerror(errno)))\n")
             return
         }
-        lines.append("naifu@MacBox ~ % \(trimmed)")
-        let output = store.execute(trimmed, in: session)
-        if !output.isEmpty {
-            lines.append(contentsOf: output.components(separatedBy: .newlines))
+
+        let master = FileHandle(fileDescriptor: masterFD, closeOnDealloc: true)
+        let slaveIn = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: false)
+        let slaveOut = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: false)
+        let slaveErr = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: true)
+        masterFile = master
+        textView.inputHandler = { [weak self] data in
+            self?.writeToPTY(data)
         }
+
+        let proc = Process()
+        proc.executableURL = launch.executable
+        proc.arguments = launch.arguments
+        proc.currentDirectoryURL = launch.currentDirectory
+        proc.environment = launch.environment
+        proc.standardInput = slaveIn
+        proc.standardOutput = slaveOut
+        proc.standardError = slaveErr
+        proc.terminationHandler = { [weak self] finished in
+            DispatchQueue.main.async {
+                self?.append("\n[process exited: \(finished.terminationStatus)]\n")
+            }
+        }
+
+        master.readabilityHandler = { [weak self] file in
+            let data = file.availableData
+            guard !data.isEmpty else { return }
+            let text = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async {
+                self?.applyTerminalOutput(text)
+            }
+        }
+
+        do {
+            try proc.run()
+            process = proc
+        } catch {
+            append("Failed to start shell: \(error.localizedDescription)\n")
+        }
+    }
+
+    private func writeToPTY(_ data: Data) {
+        do {
+            try masterFile?.write(contentsOf: data)
+        } catch {
+            append("\n[input error: \(error.localizedDescription)]\n")
+        }
+    }
+
+    private func append(_ text: String) {
+        guard !text.isEmpty else { return }
+        let attributed = NSAttributedString(
+            string: text,
+            attributes: [
+                .foregroundColor: NSColor.white,
+                .font: NSFont.monospacedSystemFont(ofSize: 16, weight: .semibold)
+            ]
+        )
+        textView.textStorage?.append(attributed)
+        textView.scrollRangeToVisible(NSRange(location: textView.string.count, length: 0))
+    }
+
+    private func deletePreviousCharacter() {
+        guard let storage = textView.textStorage, storage.length > 0 else { return }
+        storage.deleteCharacters(in: NSRange(location: storage.length - 1, length: 1))
+        textView.scrollRangeToVisible(NSRange(location: storage.length, length: 0))
+    }
+
+    private func applyTerminalOutput(_ text: String) {
+        var iterator = text.makeIterator()
+        while let char = iterator.next() {
+            if char == "\u{1B}" {
+                skipEscapeSequence(&iterator)
+                continue
+            }
+            if char == "\r" || char == "\n" {
+                append("\n")
+                continue
+            }
+            if char == "\u{08}" || char == "\u{7F}" {
+                deletePreviousCharacter()
+                continue
+            }
+            append(String(char))
+        }
+    }
+
+    private func skipEscapeSequence(_ iterator: inout String.Iterator) {
+        guard let next = iterator.next() else { return }
+        if next == "[" {
+            while let char = iterator.next() {
+                if ("@"..."~").contains(char) { break }
+            }
+        }
+    }
+
+    private func stopProcess() {
+        masterFile?.readabilityHandler = nil
+        if let process, process.isRunning {
+            process.terminate()
+        }
+        process = nil
+        masterFile = nil
+    }
+}
+
+final class TerminalTextView: NSTextView {
+    var inputHandler: ((Data) -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command) {
+            super.keyDown(with: event)
+            return
+        }
+
+        if let data = data(for: event) {
+            inputHandler?(data)
+        }
+    }
+
+    override func paste(_ sender: Any?) {
+        guard let string = NSPasteboard.general.string(forType: .string),
+              let data = string.data(using: .utf8) else { return }
+        inputHandler?(data)
+    }
+
+    private func data(for event: NSEvent) -> Data? {
+        let sequence: String?
+        switch event.keyCode {
+        case 36:
+            sequence = "\r"
+        case 51:
+            sequence = "\u{7F}"
+        case 123:
+            sequence = "\u{1B}[D"
+        case 124:
+            sequence = "\u{1B}[C"
+        case 125:
+            sequence = "\u{1B}[B"
+        case 126:
+            sequence = "\u{1B}[A"
+        case 53:
+            sequence = "\u{1B}"
+        default:
+            sequence = event.characters
+        }
+        return sequence?.data(using: .utf8)
     }
 }
 
