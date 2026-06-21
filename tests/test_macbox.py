@@ -110,6 +110,82 @@ class MacBoxTests(unittest.TestCase):
             finally:
                 macbox_cli.project_root = old
 
+    def test_prototype_backend_contract_create_changes_apply_discard(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as allowed:
+            old = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                backend = macbox_cli.sandbox_backend()
+                self.assertEqual(backend.name, "prototype")
+                backend.create("contract", writes=[allowed])
+
+                real = Path(allowed) / "contract.txt"
+                staged = backend.real_to_virtual("contract", str(real))
+                staged.parent.mkdir(parents=True)
+                staged.write_text("contract")
+
+                changes = backend.list_changes("contract")
+                self.assertEqual(len(changes), 1)
+                self.assertEqual(changes[0]["realPath"], str(macbox_cli.normalize_abs(str(real))))
+
+                applied, backup = backend.apply("contract", clear=False)
+                self.assertEqual(applied, 1)
+                self.assertIsNotNone(backup)
+                self.assertEqual(real.read_text(), "contract")
+
+                staged.write_text("discard")
+                self.assertTrue(backend.list_changes("contract"))
+                backend.discard("contract")
+                self.assertEqual(backend.list_changes("contract"), [])
+            finally:
+                macbox_cli.project_root = old
+
+    def test_prototype_backend_contract_delete_marker(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as allowed:
+            old = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                backend = macbox_cli.sandbox_backend()
+                real = Path(allowed) / "delete-contract.txt"
+                real.write_text("delete")
+                backend.create("delete-contract", writes=[allowed])
+
+                marked = backend.mark_delete("delete-contract", str(real))
+                self.assertEqual(marked, macbox_cli.normalize_abs(str(real)))
+                changes = backend.list_changes("delete-contract")
+                self.assertEqual(changes[0]["change"], "delete")
+
+                applied, _ = backend.apply("delete-contract", clear=True)
+                self.assertEqual(applied, 1)
+                self.assertFalse(real.exists())
+                self.assertEqual(backend.list_changes("delete-contract"), [])
+            finally:
+                macbox_cli.project_root = old
+
+    def test_prototype_backend_contract_launch_specs(self):
+        with tempfile.TemporaryDirectory() as project:
+            old = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                backend = macbox_cli.sandbox_backend()
+                backend.create("launch")
+
+                shell = backend.prepare_shell("launch", ["/bin/zsh", "-lc", "echo hi > relative.txt"])
+                self.assertEqual(shell.argv[:3], ["sandbox-exec", "-f", str(macbox_cli.profile_path("launch"))])
+                self.assertEqual(shell.cwd, Path(project))
+                self.assertIn("relative.txt", shell.display_command)
+                self.assertIn(".macbox/sessions/launch/overlay", shell.argv[-1])
+
+                app = backend.prepare_app("launch", Path("/bin/echo"), ["hello"])
+                self.assertEqual(app.argv[:3], ["sandbox-exec", "-f", str(macbox_cli.profile_path("launch"))])
+                self.assertEqual(app.argv[-2:], ["/bin/echo", "hello"])
+
+                terminal_command = backend.open_terminal_command("launch")
+                self.assertIn("macbox", terminal_command)
+                self.assertIn("session --name", terminal_command)
+            finally:
+                macbox_cli.project_root = old
+
     def test_apply_writes_only_configured_write_root(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as allowed:
             old = macbox_cli.project_root
