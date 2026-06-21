@@ -321,6 +321,85 @@ class MacBoxTests(unittest.TestCase):
         finally:
             macbox_cli.macfuse_status = old_status
 
+    def test_setup_dry_run_does_not_start_installers(self):
+        args = Namespace(dry_run=True, open=True, use_brew=True, install_python_binding=True, yes=True)
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": False,
+            "filesystem": None,
+            "framework": None,
+            "mountCommand": None,
+            "pythonBinding": False,
+        }
+        try:
+            with mock.patch("macbox_cli.shutil.which", return_value="/opt/homebrew/bin/brew"), \
+                    mock.patch("macbox_cli.subprocess.run") as run:
+                self.assertEqual(macbox_cli.cmd_setup(args), 0)
+            run.assert_not_called()
+        finally:
+            macbox_cli.macfuse_status = old_status
+
+    def test_setup_yes_runs_brew_but_requires_explicit_python_binding_flag(self):
+        args = Namespace(dry_run=False, open=False, use_brew=True, install_python_binding=False, yes=True)
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": False,
+            "filesystem": None,
+            "framework": None,
+            "mountCommand": None,
+            "pythonBinding": False,
+        }
+        try:
+            with mock.patch("macbox_cli.shutil.which", return_value="/opt/homebrew/bin/brew"), \
+                    mock.patch("macbox_cli.subprocess.run") as run, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                run.return_value.returncode = 0
+                self.assertEqual(macbox_cli.cmd_setup(args), 0)
+            run.assert_any_call(["/opt/homebrew/bin/brew", "install", "--cask", "macfuse"])
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("--install-python-binding --yes", out.getvalue())
+        finally:
+            macbox_cli.macfuse_status = old_status
+
+    def test_setup_explicit_python_binding_install_failure_returns_failure(self):
+        args = Namespace(dry_run=False, open=False, use_brew=False, install_python_binding=True, yes=False)
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": True,
+            "filesystem": "/Library/Filesystems/macfuse.fs",
+            "framework": None,
+            "mountCommand": "/usr/local/bin/mount_macfuse",
+            "pythonBinding": False,
+        }
+        try:
+            with mock.patch("macbox_cli.shutil.which", return_value="/opt/homebrew/bin/brew"), \
+                    mock.patch("macbox_cli.subprocess.run") as run:
+                run.return_value.returncode = 42
+                self.assertEqual(macbox_cli.cmd_setup(args), 42)
+            run.assert_called_once_with([macbox_cli.sys.executable, "-m", "pip", "install", "fusepy"])
+        finally:
+            macbox_cli.macfuse_status = old_status
+
+    def test_setup_yes_official_guide_path_does_not_prompt(self):
+        args = Namespace(dry_run=False, open=False, use_brew=False, install_python_binding=False, yes=True)
+        old_status = macbox_cli.macfuse_status
+        macbox_cli.macfuse_status = lambda: {
+            "available": False,
+            "filesystem": None,
+            "framework": None,
+            "mountCommand": None,
+            "pythonBinding": True,
+        }
+        try:
+            with mock.patch("macbox_cli.shutil.which", return_value="/opt/homebrew/bin/brew"), \
+                    mock.patch("macbox_cli.prompt_yes_no") as prompt, \
+                    mock.patch("macbox_cli.subprocess.run") as run:
+                self.assertEqual(macbox_cli.cmd_setup(args), 0)
+            prompt.assert_not_called()
+            run.assert_not_called()
+        finally:
+            macbox_cli.macfuse_status = old_status
+
     def test_fuse_backend_mount_reports_unavailable(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
             old_project_root = macbox_cli.project_root

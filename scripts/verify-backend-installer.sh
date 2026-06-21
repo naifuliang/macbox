@@ -9,9 +9,14 @@ python3 -m unittest \
   tests.test_macbox.MacBoxTests.test_backend_install_execute_requires_explicit_brew \
   tests.test_macbox.MacBoxTests.test_backend_install_rejects_open_and_execute_together \
   tests.test_macbox.MacBoxTests.test_backend_install_rejects_json_with_action_flags \
-  tests.test_macbox.MacBoxTests.test_backend_install_execute_runs_brew_when_explicit
+  tests.test_macbox.MacBoxTests.test_backend_install_execute_runs_brew_when_explicit \
+  tests.test_macbox.MacBoxTests.test_setup_dry_run_does_not_start_installers \
+  tests.test_macbox.MacBoxTests.test_setup_yes_runs_brew_but_requires_explicit_python_binding_flag \
+  tests.test_macbox.MacBoxTests.test_setup_explicit_python_binding_install_failure_returns_failure \
+  tests.test_macbox.MacBoxTests.test_setup_yes_official_guide_path_does_not_prompt
 
 ./macbox backend status --json >/tmp/macbox-backend-status.json
+./macbox setup --dry-run >/tmp/macbox-setup.txt
 ./macbox backend install --backend macfuse --dry-run >/tmp/macbox-backend-install.txt
 ./macbox backend install --backend macfuse --json >/tmp/macbox-backend-install.json
 if ./macbox backend doctor --json >/tmp/macbox-backend-doctor.json; then

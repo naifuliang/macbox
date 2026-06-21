@@ -1336,6 +1336,84 @@ def cmd_backend_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def prompt_yes_no(question: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    answer = input(f"{question} [{suffix}] ").strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def run_setup_command(command: list[str], execute: bool) -> int:
+    printable = " ".join(shlex.quote(part) for part in command)
+    print(f"+ {printable}")
+    if not execute:
+        return 0
+    return subprocess.run(command).returncode
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    report = backend_doctor_report()
+    status = report["status"]
+    macfuse = status["macfuse"]
+    brew = status["homebrew"]["path"]
+
+    print("MacBox setup")
+    print("------------")
+    print("Goal: install dependencies for the mounted FUSE backend.")
+    print("Note: product readiness still requires session execution through the mounted backend.")
+    print(f"macFUSE: {'installed' if macfuse['available'] else 'missing'}")
+    print(f"Python FUSE binding: {'installed' if macfuse['pythonBinding'] else 'missing'}")
+    print(f"Homebrew: {brew or 'not found'}")
+    print()
+
+    if args.dry_run:
+        print("Dry run. No install actions will be started.")
+
+    failures: list[int] = []
+
+    if not macfuse["available"]:
+        if brew and args.use_brew:
+            command = [brew, "install", "--cask", "macfuse"]
+            execute = args.yes or (not args.dry_run and prompt_yes_no("Install macFUSE with Homebrew now?"))
+            rc = run_setup_command(command, execute and not args.dry_run)
+            if execute and not args.dry_run and rc:
+                failures.append(rc)
+        else:
+            print("macFUSE requires a macOS system extension approval.")
+            print("Official guide: https://macfuse.github.io/")
+            should_open = args.open or (
+                not args.yes and not args.dry_run and prompt_yes_no("Open the official macFUSE install guide now?")
+            )
+            if should_open and not args.dry_run:
+                subprocess.run(["open", "https://macfuse.github.io/"], check=False)
+                print("Opened macFUSE guide.")
+            if brew:
+                print(f"Homebrew alternative: {brew} install --cask macfuse")
+    else:
+        print("macFUSE is already visible to MacBox.")
+
+    if not macfuse["pythonBinding"]:
+        command = [sys.executable, "-m", "pip", "install", "fusepy"]
+        should_install = args.install_python_binding or (
+            not args.yes and not args.dry_run and prompt_yes_no("Install Python FUSE binding with this Python interpreter now?")
+        )
+        if should_install or args.dry_run:
+            rc = run_setup_command(command, should_install and not args.dry_run)
+            if should_install and not args.dry_run and rc:
+                failures.append(rc)
+        elif args.yes:
+            print("Skipping Python FUSE binding install; pass --install-python-binding --yes to install fusepy.")
+    else:
+        print("Python FUSE binding is already available.")
+
+    print()
+    print("After installing, run:")
+    print("  ./macbox backend doctor")
+    print("  ./scripts/verify-fuse-overlay-writes.sh")
+    return failures[0] if failures else 0
+
+
 def cmd_mount(args: argparse.Namespace) -> int:
     if args.backend != "fuse":
         raise SystemExit(f"unsupported backend for mount: {args.backend}")
@@ -1412,6 +1490,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("fuse-status", help="show macFUSE availability for the future fuse backend")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_fuse_status)
+
+    p = sub.add_parser("setup", help="guided setup for the mounted FUSE backend")
+    p.add_argument("--dry-run", action="store_true", help="show actions without opening pages or running installers")
+    p.add_argument("--open", action="store_true", help="open the official macFUSE install guide when needed")
+    p.add_argument("--use-brew", action="store_true", help="prefer Homebrew for macFUSE installation")
+    p.add_argument("--install-python-binding", action="store_true", help="install fusepy for the current Python interpreter")
+    p.add_argument("--yes", action="store_true", help="run explicit install steps without interactive prompts")
+    p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("backend", help="manage production backend dependencies")
     backend_sub = p.add_subparsers(dest="backend_cmd", required=True)
