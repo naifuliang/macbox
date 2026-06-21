@@ -51,7 +51,9 @@ MacBox virtual root mount
 Apply Changes -> checked copy back to real disk
 ```
 
-On macOS, the practical first target is a macFUSE backend.
+On macOS, the practical first target is a macFUSE backend. A workspace-only
+backend is not a production path for MacBox because the product requirement is
+arbitrary real paths behind a virtual write layer.
 
 ## Backend Contract
 
@@ -102,7 +104,7 @@ Acceptance:
 - Backend contract tests cover create, changes, apply, discard, delete, launch
   specs, and path mapping.
 
-### Phase 2: macFUSE Read-Only Mount
+### Phase 2: macFUSE Detection And Mount Command Shape
 
 Acceptance:
 
@@ -119,7 +121,34 @@ Acceptance:
   reading through the mount falls back to the real disk, and
   `macbox unmount --name demo` cleans up the mount.
 
-### Phase 3: Overlay Writes
+### Phase 3: Backend Installer And Doctor
+
+Acceptance:
+
+- `macbox backend status --json` reports the default prototype backend, the
+  production FUSE backend, macFUSE detection, Homebrew detection, and that
+  arbitrary virtual paths are required but not ready yet.
+- `macbox backend doctor --json` returns actionable checks and exits non-zero
+  when blocking dependencies or implementation gaps remain.
+- `macbox backend install --backend macfuse --dry-run` prints an install plan
+  without changing the machine.
+- `macbox backend install --backend macfuse --open` starts the official guided
+  installer flow.
+- `macbox backend install --backend macfuse --use-brew --execute` only runs
+  Homebrew when the user explicitly asks for that path.
+- `scripts/verify-backend-installer.sh` passes on hosts without macFUSE.
+
+### Phase 4: Mounted Read-Only Virtual Root
+
+Acceptance:
+
+- With macFUSE installed, `macbox mount --name demo --mount <path>` creates a
+  virtual root.
+- Reads through the virtual root fall back to the real disk.
+- The mount presents arbitrary absolute real paths under the virtual root.
+- `macbox unmount --name demo` cleans up the mount.
+
+### Phase 5: Overlay Writes
 
 Acceptance:
 
@@ -128,7 +157,7 @@ Acceptance:
   wrappers.
 - `changes` accurately reports writes, deletes, and renames.
 
-### Phase 4: Session Execution From Virtual Root
+### Phase 6: Session Execution From Virtual Root
 
 Acceptance:
 
@@ -137,7 +166,7 @@ Acceptance:
   reporting.
 - Exiting the shell leaves the real disk unchanged until apply.
 
-### Phase 5: Apply, Discard, Diff
+### Phase 7: Apply, Discard, Diff
 
 Acceptance:
 
@@ -146,7 +175,7 @@ Acceptance:
 - `diff` shows staged content changes.
 - Apply creates backups before overwriting or deleting real paths.
 
-### Phase 6: GUI Integration
+### Phase 8: GUI Integration
 
 Acceptance:
 
@@ -154,14 +183,14 @@ Acceptance:
 - File sidebar shows backend changes and diffs.
 - Apply and discard work from the GUI.
 
-### Phase 7: Compatibility Matrix
+### Phase 9: Compatibility Matrix
 
 Acceptance:
 
 - Compatibility results are recorded for shell tools, editors, package managers,
   git workflows, Claude Code, and basic GUI app saves.
 
-### Phase 8: Recovery
+### Phase 10: Recovery
 
 Acceptance:
 
