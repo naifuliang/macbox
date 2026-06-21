@@ -1,10 +1,15 @@
 import tempfile
 import unittest
+import os
+import errno
+import io
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
+from contextlib import redirect_stdout
 
 import macbox_cli
+import macbox_fuse
 
 
 class MacBoxTests(unittest.TestCase):
@@ -230,7 +235,7 @@ class MacBoxTests(unittest.TestCase):
             self.assertIn("macfuse-installed", blocking_ids)
             self.assertIn("python-fuse-binding", blocking_ids)
             self.assertTrue(any("Install macFUSE" in action for action in report["nextActions"]))
-            self.assertTrue(any("mounted overlay filesystem" in action for action in report["nextActions"]))
+            self.assertTrue(any("overlay writes" in action for action in report["nextActions"]))
         finally:
             macbox_cli.macfuse_status = old_status
 
@@ -248,7 +253,7 @@ class MacBoxTests(unittest.TestCase):
             self.assertFalse(report["ready"])
             blocking_ids = {check["id"] for check in report["checks"] if not check["ok"] and check["severity"] == "blocking"}
             self.assertEqual(blocking_ids, {"arbitrary-virtual-paths"})
-            self.assertTrue(any("mounted overlay filesystem" in action for action in report["nextActions"]))
+            self.assertTrue(any("overlay writes" in action for action in report["nextActions"]))
             self.assertFalse(report["installPlan"]["backendReady"])
             self.assertTrue(report["installPlan"]["macfuseInstalled"])
         finally:
@@ -352,6 +357,205 @@ class MacBoxTests(unittest.TestCase):
             finally:
                 macbox_cli.project_root = old_project_root
                 macbox_cli.macfuse_status = old_status
+
+    def test_fuse_readonly_operations_read_real_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            real = Path(td) / "readable.txt"
+            real.write_text("hello fuse")
+            ops = macbox_fuse.ReadOnlyMirrorOperations()
+
+            attrs = ops.getattr(str(real))
+            self.assertEqual(attrs["st_size"], len("hello fuse"))
+            fh = ops.open(str(real), 0)
+            try:
+                self.assertEqual(ops.read(str(real), 5, 0, fh), b"hello")
+            finally:
+                ops.release(str(real), fh)
+            self.assertIn("readable.txt", ops.readdir(td, None))
+            with self.assertRaises(OSError):
+                ops.mkdir(str(Path(td) / "blocked"), 0o755)
+
+    def test_fuse_access_reports_missing_paths_as_enoent(self):
+        ops = macbox_fuse.ReadOnlyMirrorOperations()
+        with self.assertRaises(OSError) as ctx:
+            ops.access("/definitely/missing/macbox/path", os.F_OK)
+        self.assertEqual(ctx.exception.errno, errno.ENOENT)
+        with self.assertRaises(OSError) as ctx:
+            ops.access("/definitely/missing/macbox/path", os.W_OK)
+        self.assertEqual(ctx.exception.errno, errno.ENOENT)
+
+    def test_fuse_backend_mount_starts_helper_and_records_metadata(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
+            old_project_root = macbox_cli.project_root
+            old_status = macbox_cli.macfuse_status
+            macbox_cli.project_root = lambda: Path(project)
+            macbox_cli.macfuse_status = lambda: {
+                "available": True,
+                "filesystem": "/Library/Filesystems/macfuse.fs",
+                "framework": None,
+                "mountCommand": "/usr/local/bin/mount_macfuse",
+                "pythonBinding": True,
+            }
+            helper = Path(project) / "macbox_fuse.py"
+            helper.write_text("# helper")
+
+            class FakeProcess:
+                pid = 4242
+
+                def poll(self):
+                    return None
+
+            try:
+                with mock.patch("macbox_cli.subprocess.Popen", return_value=FakeProcess()) as popen, \
+                        mock.patch("macbox_cli.wait_for_mount", return_value=True):
+                    mounted = macbox_cli.fuse_backend().mount_readonly("mounted", mount)
+
+                self.assertEqual(mounted, macbox_cli.normalize_abs(mount))
+                metadata = macbox_cli.read_metadata("mounted")
+                self.assertEqual(metadata["status"], "mounted")
+                self.assertEqual(metadata["mountPath"], str(macbox_cli.normalize_abs(mount)))
+                self.assertEqual(metadata["mountPid"], 4242)
+                self.assertTrue(metadata["readOnly"])
+                command = popen.call_args.args[0]
+                self.assertIn(str(helper), command)
+                self.assertIn("--session", command)
+                self.assertIn("--mount", command)
+                self.assertIn("--foreground", command)
+                self.assertTrue(macbox_cli.mount_record_path("mounted").exists())
+            finally:
+                macbox_cli.project_root = old_project_root
+                macbox_cli.macfuse_status = old_status
+
+    def test_fuse_backend_foreground_timeout_terminates_helper(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
+            old_project_root = macbox_cli.project_root
+            old_status = macbox_cli.macfuse_status
+            macbox_cli.project_root = lambda: Path(project)
+            macbox_cli.macfuse_status = lambda: {
+                "available": True,
+                "filesystem": "/Library/Filesystems/macfuse.fs",
+                "framework": None,
+                "mountCommand": "/usr/local/bin/mount_macfuse",
+                "pythonBinding": True,
+            }
+            (Path(project) / "macbox_fuse.py").write_text("# helper")
+
+            class FakeProcess:
+                pid = 4242
+                terminated = False
+
+                def poll(self):
+                    return None
+
+                def terminate(self):
+                    self.terminated = True
+
+            proc = FakeProcess()
+            try:
+                with mock.patch("macbox_cli.subprocess.Popen", return_value=proc), \
+                        mock.patch("macbox_cli.wait_for_mount", return_value=False):
+                    with self.assertRaises(SystemExit):
+                        macbox_cli.fuse_backend().mount_readonly("foreground-timeout", mount, foreground=True)
+                self.assertTrue(proc.terminated)
+            finally:
+                macbox_cli.project_root = old_project_root
+                macbox_cli.macfuse_status = old_status
+
+    def test_fuse_backend_foreground_exit_removes_mount_record(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
+            old_project_root = macbox_cli.project_root
+            old_status = macbox_cli.macfuse_status
+            macbox_cli.project_root = lambda: Path(project)
+            macbox_cli.macfuse_status = lambda: {
+                "available": True,
+                "filesystem": "/Library/Filesystems/macfuse.fs",
+                "framework": None,
+                "mountCommand": "/usr/local/bin/mount_macfuse",
+                "pythonBinding": True,
+            }
+            (Path(project) / "macbox_fuse.py").write_text("# helper")
+
+            class FakeProcess:
+                pid = 4242
+
+                def poll(self):
+                    return None
+
+                def wait(self):
+                    return 0
+
+            try:
+                with mock.patch("macbox_cli.subprocess.Popen", return_value=FakeProcess()), \
+                        mock.patch("macbox_cli.wait_for_mount", return_value=True):
+                    macbox_cli.fuse_backend().mount_readonly("foreground-exit", mount, foreground=True)
+                metadata = macbox_cli.read_metadata("foreground-exit")
+                self.assertEqual(metadata["status"], "idle")
+                self.assertIsNone(metadata["mountPath"])
+                self.assertFalse(macbox_cli.mount_record_path("foreground-exit").exists())
+            finally:
+                macbox_cli.project_root = old_project_root
+                macbox_cli.macfuse_status = old_status
+
+    def test_cmd_mount_foreground_reports_exit_not_mounted(self):
+        args = Namespace(backend="fuse", name="fg", mount="/tmp/fg", read=None, write=None, foreground=True)
+        out = io.StringIO()
+        with mock.patch("macbox_cli.fuse_backend") as backend_factory, redirect_stdout(out):
+            backend_factory.return_value.mount_readonly.return_value = Path("/tmp/fg")
+            rc = macbox_cli.cmd_mount(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("foreground mount exited", out.getvalue())
+        self.assertNotIn("mounted fg", out.getvalue())
+
+    def test_fuse_backend_unmount_preserves_metadata_on_failure(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
+            old_project_root = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                macbox_cli.write_metadata("mounted", backend="fuse", status="mounted", mountPath=str(mount), mountPid=4242, readOnly=True)
+                failed = mock.Mock()
+                failed.returncode = 1
+                failed.stderr = "busy"
+                failed.stdout = ""
+                with mock.patch("macbox_cli.subprocess.run", return_value=failed):
+                    with self.assertRaises(SystemExit) as ctx:
+                        macbox_cli.fuse_backend().unmount("mounted")
+                self.assertIn("failed to unmount", str(ctx.exception))
+                metadata = macbox_cli.read_metadata("mounted")
+                self.assertEqual(metadata["mountPath"], mount)
+                self.assertEqual(metadata["status"], "mounted")
+            finally:
+                macbox_cli.project_root = old_project_root
+
+    def test_fuse_backend_unmount_removes_mount_record_on_success(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
+            old_project_root = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                macbox_cli.write_metadata("mounted", backend="fuse", status="mounted", mountPath=str(mount), mountPid=4242, readOnly=True)
+                macbox_cli.mount_record_path("mounted").parent.mkdir(parents=True, exist_ok=True)
+                macbox_cli.mount_record_path("mounted").write_text("{}")
+                ok = mock.Mock()
+                ok.returncode = 0
+                ok.stderr = ""
+                ok.stdout = ""
+                with mock.patch("macbox_cli.subprocess.run", return_value=ok):
+                    macbox_cli.fuse_backend().unmount("mounted")
+                metadata = macbox_cli.read_metadata("mounted")
+                self.assertIsNone(metadata["mountPath"])
+                self.assertEqual(metadata["status"], "idle")
+                self.assertFalse(macbox_cli.mount_record_path("mounted").exists())
+            finally:
+                macbox_cli.project_root = old_project_root
+
+    def test_fuse_readlink_rewrites_absolute_targets_into_virtual_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target.txt"
+            target.write_text("target")
+            link = Path(td) / "absolute-link"
+            os.symlink(str(target), link)
+            virtual_root = Path("/tmp/macbox-virtual-root")
+            ops = macbox_fuse.ReadOnlyMirrorOperations(virtual_root)
+            self.assertEqual(ops.readlink(str(link)), str(virtual_root / str(target).lstrip("/")))
 
     def test_apply_writes_only_configured_write_root(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as allowed:
