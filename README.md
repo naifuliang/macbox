@@ -107,17 +107,23 @@ MacBox can mount arbitrary real paths behind a virtual copy-on-write layer.
 Current commands expose dependency status and guided setup:
 
 ```sh
+./macbox setup
 ./macbox backend status
 ./macbox backend doctor
 ./macbox backend install --backend macfuse --dry-run
 ./macbox backend install --backend macfuse --open
 ```
 
-The installer command is explicit by design. It prints the plan by default,
-opens the official macFUSE install guide only with `--open`, and only runs the
-Homebrew cask path with `--use-brew --execute`. Installing macFUSE alone does
-not make the production backend ready; `backend doctor` also checks the Python
-FUSE binding and the mounted overlay implementation status.
+`setup` is the recommended entry point. It checks macFUSE, the Python FUSE
+binding, and Homebrew, then guides the next install step. Installer commands are
+explicit by design: MacBox prints the plan by default, opens the official
+macFUSE install guide only with `--open`, and only runs the Homebrew cask path
+when you choose that flow. Installing macFUSE alone does not make the production
+backend ready; `backend doctor` also checks the Python FUSE binding and mounted
+backend status.
+For noninteractive setup, `--yes --use-brew` may run the macFUSE Homebrew cask;
+installing `fusepy` into the current Python still requires the explicit
+`--install-python-binding` flag.
 
 The mounted backend can read real paths and stage writes into the session
 overlay:
