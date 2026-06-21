@@ -107,9 +107,17 @@ Acceptance:
 Acceptance:
 
 - MacBox can detect whether macFUSE is installed.
-- `macbox mount --name demo --mount <path>` creates a read-only virtual root.
-- Reading through the mount falls back to the real disk.
-- `macbox unmount --name demo` cleans up the mount.
+- `macbox fuse-status --json` reports macFUSE filesystem/framework/command and
+  Python binding availability.
+- `macbox mount --backend fuse --name demo --mount <path>` has a stable command
+  shape and reports a clear unavailable/dependency error when macFUSE or Python
+  FUSE bindings are missing.
+- `scripts/verify-fuse-readonly.sh` passes on hosts without macFUSE by
+  explicitly reporting that mount verification is not runnable.
+- On a host with macFUSE and Python FUSE bindings, the next acceptance target is:
+  `macbox mount --name demo --mount <path>` creates a read-only virtual root,
+  reading through the mount falls back to the real disk, and
+  `macbox unmount --name demo` cleans up the mount.
 
 ### Phase 3: Overlay Writes
 

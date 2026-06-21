@@ -186,6 +186,54 @@ class MacBoxTests(unittest.TestCase):
             finally:
                 macbox_cli.project_root = old
 
+    def test_macfuse_status_shape(self):
+        status = macbox_cli.macfuse_status()
+        self.assertIn("available", status)
+        self.assertIn("filesystem", status)
+        self.assertIn("framework", status)
+        self.assertIn("mountCommand", status)
+        self.assertIn("pythonBinding", status)
+
+    def test_fuse_backend_mount_reports_unavailable(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
+            old_project_root = macbox_cli.project_root
+            old_status = macbox_cli.macfuse_status
+            macbox_cli.project_root = lambda: Path(project)
+            macbox_cli.macfuse_status = lambda: {
+                "available": False,
+                "filesystem": None,
+                "framework": None,
+                "mountCommand": None,
+                "pythonBinding": False,
+            }
+            try:
+                with self.assertRaises(SystemExit) as ctx:
+                    macbox_cli.fuse_backend().mount_readonly("fuse-unavailable", mount)
+                self.assertIn("macFUSE is not available", str(ctx.exception))
+            finally:
+                macbox_cli.project_root = old_project_root
+                macbox_cli.macfuse_status = old_status
+
+    def test_fuse_backend_mount_reports_missing_python_binding(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
+            old_project_root = macbox_cli.project_root
+            old_status = macbox_cli.macfuse_status
+            macbox_cli.project_root = lambda: Path(project)
+            macbox_cli.macfuse_status = lambda: {
+                "available": True,
+                "filesystem": "/Library/Filesystems/macfuse.fs",
+                "framework": None,
+                "mountCommand": "/usr/local/bin/mount_macfuse",
+                "pythonBinding": False,
+            }
+            try:
+                with self.assertRaises(SystemExit) as ctx:
+                    macbox_cli.fuse_backend().mount_readonly("fuse-no-binding", mount)
+                self.assertIn("Python FUSE binding is unavailable", str(ctx.exception))
+            finally:
+                macbox_cli.project_root = old_project_root
+                macbox_cli.macfuse_status = old_status
+
     def test_apply_writes_only_configured_write_root(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as allowed:
             old = macbox_cli.project_root
