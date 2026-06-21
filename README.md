@@ -2,6 +2,32 @@
 
 MacBox is a first-pass macOS sandbox terminal manager.
 
+## Status
+
+The current sandbox backend is a **prototype**. It is good enough to validate
+the CLI, session model, change tracking, and manager UI, but it is not the final
+filesystem architecture.
+
+Current behavior:
+
+- Real disk reads are allowed.
+- Real disk writes are blocked by `sandbox-exec`.
+- Shell redirections and a small set of shell wrappers stage writes under
+  `.macbox/sessions/<name>/overlay`.
+- `apply` copies staged changes back to the real paths after write-root checks.
+
+Known boundary:
+
+- This is not a complete transparent copy-on-write filesystem.
+- System-protected binaries do not reliably honor `DYLD_INSERT_LIBRARIES`.
+- Shell wrappers only cover common interactive commands such as redirection,
+  `mkdir`, and `touch`.
+- A production backend should move to a mounted overlay filesystem, most likely
+  macFUSE on macOS.
+
+See [docs/sandbox-architecture.md](docs/sandbox-architecture.md) for the
+architecture decision and staged roadmap.
+
 It has two parts:
 
 - `macbox`: a CLI for creating sessions and entering a sandboxed shell.
@@ -16,15 +42,24 @@ chmod +x ./macbox
 
 Inside a sandbox session:
 
+These commands are covered by the prototype shell layer. They are examples, not
+a guarantee of general filesystem transparency:
+
 ```sh
-echo hello > "$(vpath ~/Desktop/hello-from-macbox.txt)"
+echo hello > ~/Desktop/hello-from-macbox.txt
+mkdir scratch
+touch scratch/example.txt
 mb-changes
 mb-apply
 ```
 
-The real disk is readable. Direct real-disk writes are blocked by
-`sandbox-exec`. Staged writes live under `.macbox/sessions/<name>/overlay` and
-are copied to the real path only after `apply`.
+Staged writes live under `.macbox/sessions/<name>/overlay` and are copied to the
+real path only after `apply`. `vpath` remains available as an explicit escape
+hatch when a command is not covered by the prototype wrappers:
+
+```sh
+echo hello > "$(vpath ~/Desktop/hello-from-macbox.txt)"
+```
 
 `./macbox` creates a fresh sandbox session and enters it immediately. For a
 named session, use:
@@ -63,10 +98,16 @@ The manager opens as a compact glass-style window:
 ./macbox new --name plain --plain
 ```
 
-## Current boundary
+## Verify
 
-This version is intentionally conservative. macOS does not provide a simple
-per-process transparent copy-on-write filesystem through `sandbox-exec`.
-Commands must write through `vpath` to stage a virtual file. Fully transparent
-redirection of writes to their original paths needs a heavier filesystem layer
-such as macFUSE or a system extension.
+```sh
+./scripts/verify-prototype.sh
+```
+
+The integration test uses `sandbox-exec`. If the outer execution environment
+blocks `sandbox-exec`, the normal test discovery skips that test; run the
+integration test directly from a normal macOS shell for full validation:
+
+```sh
+python3 -m unittest tests/test_macbox_integration.py
+```
