@@ -1265,6 +1265,10 @@ class DockerBackend(SandboxBackend):
             dockerImage=read_metadata(name).get("dockerImage", "python:3.12-slim"),
         )
 
+    def set_image(self, name: str, image: str | None) -> None:
+        if image:
+            write_metadata(name, dockerImage=image)
+
     def roots(self, name: str) -> list[Path]:
         cfg = read_config(name)
         return [normalize_abs(root) for root in (cfg["write"] or cfg["read"] or [str(project_root())])]
@@ -1295,6 +1299,8 @@ class DockerBackend(SandboxBackend):
             "-i",
             "--network",
             "none",
+            "--entrypoint",
+            "",
             "-e",
             "MACBOX_DOCKER_ROOTS=" + os.pathsep.join(str(root) for root in roots),
             "-v",
@@ -1311,7 +1317,7 @@ class DockerBackend(SandboxBackend):
                 raise SystemExit(f"docker backend root must be an existing directory: {root}")
             argv.extend(["-v", f"{root}:/macbox/roots/{idx}:ro"])
         image = read_metadata(name).get("dockerImage", "python:3.12-slim")
-        argv.extend([image, "python", "/macbox/session/docker_runner.py", *command])
+        argv.extend([image, "python3", "/macbox/session/docker_runner.py", *command])
         return LaunchSpec(
             argv=argv,
             env=os.environ.copy(),
@@ -1410,7 +1416,10 @@ class LaunchSpec:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    backend_by_name(args.backend).ensure(args.name, args.read, args.write)
+    backend = backend_by_name(args.backend)
+    backend.ensure(args.name, args.read, args.write)
+    if args.backend == "docker":
+        docker_backend().set_image(args.name, args.image)
     print(f"created session: {sandbox_root(args.name)}")
     return 0
 
@@ -1418,6 +1427,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_new(args: argparse.Namespace) -> int:
     name = args.name or f"session-{uuid.uuid4().hex[:8]}"
     backend_by_name(args.backend).create(name, args.read, args.write, plain=args.plain)
+    if args.backend == "docker":
+        docker_backend().set_image(name, args.image)
     print(name)
     return 0
 
@@ -1432,6 +1443,8 @@ def cmd_path(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     backend = backend_by_name(args.backend)
     backend.ensure(args.name, args.read, args.write)
+    if args.backend == "docker":
+        docker_backend().set_image(args.name, args.image)
     command = args.command
     stdin_data = None if command or sys.stdin.isatty() else sys.stdin.read()
     spec = backend.prepare_shell(args.name, command, stdin_data=stdin_data)
@@ -1903,6 +1916,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--read", action="append", default=[], help="read root to document/allow")
     p.add_argument("--write", action="append", default=[], help="real root that Apply Changes may modify")
+    p.add_argument("--image", default=None, help="Docker image for docker backend sessions")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("new", help="create a new sandbox session")
@@ -1911,6 +1925,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plain", action="store_true", help="create a normal non-sandbox session")
     p.add_argument("--read", action="append", default=[], help="read root to document/allow")
     p.add_argument("--write", action="append", default=[], help="real root that Apply Changes may modify")
+    p.add_argument("--image", default=None, help="Docker image for docker backend sessions")
     p.set_defaults(func=cmd_new)
 
     p = sub.add_parser("run", help="run a command or interactive shell in a sandbox backend")
@@ -1918,6 +1933,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--read", action="append", default=None)
     p.add_argument("--write", action="append", default=None)
+    p.add_argument("--image", default=None, help="Docker image for docker backend sessions")
     p.add_argument("command", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_run)
 
@@ -1926,6 +1942,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", default="prototype", choices=["prototype", "docker"])
     p.add_argument("--read", action="append", default=None)
     p.add_argument("--write", action="append", default=None)
+    p.add_argument("--image", default=None, help="Docker image for docker backend sessions")
     p.add_argument("command", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_session)
 
