@@ -214,6 +214,9 @@ class MacBoxTests(unittest.TestCase):
             self.assertEqual(status["productionBackend"], "fuse")
             self.assertTrue(status["arbitraryVirtualPaths"]["required"])
             self.assertFalse(status["arbitraryVirtualPaths"]["ready"])
+            self.assertTrue(status["arbitraryVirtualPaths"]["readOnlyMountImplemented"])
+            self.assertTrue(status["arbitraryVirtualPaths"]["writeOverlayImplemented"])
+            self.assertFalse(status["arbitraryVirtualPaths"]["sessionExecutionImplemented"])
             self.assertIn("workspace-only", status["arbitraryVirtualPaths"]["note"])
         finally:
             macbox_cli.macfuse_status = old_status
@@ -235,7 +238,7 @@ class MacBoxTests(unittest.TestCase):
             self.assertIn("macfuse-installed", blocking_ids)
             self.assertIn("python-fuse-binding", blocking_ids)
             self.assertTrue(any("Install macFUSE" in action for action in report["nextActions"]))
-            self.assertTrue(any("overlay writes" in action for action in report["nextActions"]))
+            self.assertTrue(any("session execution" in action for action in report["nextActions"]))
         finally:
             macbox_cli.macfuse_status = old_status
 
@@ -253,7 +256,7 @@ class MacBoxTests(unittest.TestCase):
             self.assertFalse(report["ready"])
             blocking_ids = {check["id"] for check in report["checks"] if not check["ok"] and check["severity"] == "blocking"}
             self.assertEqual(blocking_ids, {"arbitrary-virtual-paths"})
-            self.assertTrue(any("overlay writes" in action for action in report["nextActions"]))
+            self.assertTrue(any("session execution" in action for action in report["nextActions"]))
             self.assertFalse(report["installPlan"]["backendReady"])
             self.assertTrue(report["installPlan"]["macfuseInstalled"])
         finally:
@@ -353,7 +356,7 @@ class MacBoxTests(unittest.TestCase):
             try:
                 with self.assertRaises(SystemExit) as ctx:
                     macbox_cli.fuse_backend().mount_readonly("fuse-no-binding", mount)
-                self.assertIn("Python FUSE binding is unavailable", str(ctx.exception))
+                self.assertIn("mounted FUSE overlay backend is disabled", str(ctx.exception))
             finally:
                 macbox_cli.project_root = old_project_root
                 macbox_cli.macfuse_status = old_status
@@ -383,6 +386,199 @@ class MacBoxTests(unittest.TestCase):
         with self.assertRaises(OSError) as ctx:
             ops.access("/definitely/missing/macbox/path", os.W_OK)
         self.assertEqual(ctx.exception.errno, errno.ENOENT)
+
+    def test_fuse_overlay_create_write_stages_without_real_write(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            overlay = Path(project) / "overlay"
+            deletes = Path(project) / "deletes.txt"
+            real = Path(real_dir) / "new.txt"
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=overlay, deletes_file=deletes)
+
+            fh = ops.create(str(real), 0o644)
+            try:
+                self.assertEqual(ops.write(str(real), b"overlay", 0, fh), len(b"overlay"))
+            finally:
+                ops.release(str(real), fh)
+
+            staged = overlay / str(real.resolve(strict=False)).lstrip("/")
+            self.assertEqual(staged.read_text(), "overlay")
+            self.assertFalse(real.exists())
+            self.assertEqual(ops.getattr(str(real))["st_size"], len("overlay"))
+
+    def test_fuse_overlay_failed_write_open_does_not_leave_copy_up(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            overlay = Path(project) / "overlay"
+            real = Path(real_dir) / "real.txt"
+            real.write_text("real")
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=overlay, deletes_file=Path(project) / "deletes.txt")
+
+            with self.assertRaises(OSError) as ctx:
+                ops.open(str(real), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            self.assertEqual(ctx.exception.errno, errno.EEXIST)
+            self.assertFalse((overlay / str(real.resolve(strict=False)).lstrip("/")).exists())
+
+    def test_fuse_overlay_mkdir_can_recreate_tombstoned_path(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            real = Path(real_dir) / "replace-me"
+            real.write_text("real")
+            overlay = Path(project) / "overlay"
+            deletes = Path(project) / "deletes.txt"
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=overlay, deletes_file=deletes)
+
+            ops.unlink(str(real))
+            ops.mkdir(str(real), 0o755)
+
+            staged = overlay / str(real.resolve(strict=False)).lstrip("/")
+            self.assertTrue(staged.is_dir())
+            self.assertTrue(real.exists())
+
+    def test_fuse_overlay_recreated_tombstoned_entries_can_be_deleted_again(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            file_path = Path(real_dir) / "replace-file"
+            file_path.write_text("real")
+            dir_path = Path(real_dir) / "replace-dir"
+            dir_path.mkdir()
+            overlay = Path(project) / "overlay"
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=overlay, deletes_file=Path(project) / "deletes.txt")
+
+            ops.unlink(str(file_path))
+            fh = ops.create(str(file_path), 0o644)
+            ops.release(str(file_path), fh)
+            ops.unlink(str(file_path))
+            self.assertFalse((overlay / str(file_path.resolve(strict=False)).lstrip("/")).exists())
+
+            ops.rmdir(str(dir_path))
+            ops.mkdir(str(dir_path), 0o755)
+            ops.rmdir(str(dir_path))
+            self.assertFalse((overlay / str(dir_path.resolve(strict=False)).lstrip("/")).exists())
+
+    def test_fuse_overlay_read_prefers_staged_file(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            overlay = Path(project) / "overlay"
+            real = Path(real_dir) / "file.txt"
+            real.write_text("real")
+            staged = overlay / str(real.resolve(strict=False)).lstrip("/")
+            staged.parent.mkdir(parents=True)
+            staged.write_text("staged")
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=overlay, deletes_file=Path(project) / "deletes.txt")
+
+            fh = ops.open(str(real), os.O_RDONLY)
+            try:
+                self.assertEqual(ops.read(str(real), 20, 0, fh), b"staged")
+            finally:
+                ops.release(str(real), fh)
+
+    def test_fuse_overlay_unlink_marks_tombstone_and_hides_real_file(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            real = Path(real_dir) / "delete.txt"
+            real.write_text("real")
+            deletes = Path(project) / "deletes.txt"
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=Path(project) / "overlay", deletes_file=deletes)
+
+            ops.unlink(str(real))
+
+            self.assertTrue(real.exists())
+            self.assertIn(str(real.resolve(strict=False)), deletes.read_text())
+            with self.assertRaises(OSError) as ctx:
+                ops.getattr(str(real))
+            self.assertEqual(ctx.exception.errno, errno.ENOENT)
+
+    def test_fuse_overlay_deleted_directory_hides_children(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            real = Path(real_dir) / "dir"
+            real.mkdir()
+            child = real / "child.txt"
+            child.write_text("child")
+            deletes = Path(project) / "deletes.txt"
+            deletes.write_text(str(real.resolve(strict=False)) + "\n")
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=Path(project) / "overlay", deletes_file=deletes)
+
+            with self.assertRaises(OSError) as ctx:
+                ops.getattr(str(child))
+            self.assertEqual(ctx.exception.errno, errno.ENOENT)
+            with self.assertRaises(OSError) as ctx:
+                ops.readdir(str(real), None)
+            self.assertEqual(ctx.exception.errno, errno.ENOENT)
+
+    def test_fuse_overlay_rejects_unsafe_directory_deletes_and_existing_mkdir(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            root = Path(real_dir)
+            directory = root / "dir"
+            directory.mkdir()
+            (directory / "child.txt").write_text("child")
+            file_path = root / "file.txt"
+            file_path.write_text("file")
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=Path(project) / "overlay", deletes_file=Path(project) / "deletes.txt")
+
+            with self.assertRaises(OSError) as ctx:
+                ops.unlink(str(directory))
+            self.assertEqual(ctx.exception.errno, errno.EISDIR)
+
+            with self.assertRaises(OSError) as ctx:
+                ops.rmdir(str(directory))
+            self.assertEqual(ctx.exception.errno, errno.ENOTEMPTY)
+
+            with self.assertRaises(OSError) as ctx:
+                ops.mkdir(str(file_path), 0o755)
+            self.assertEqual(ctx.exception.errno, errno.EEXIST)
+
+            with self.assertRaises(OSError) as ctx:
+                ops.mkdir(str(directory), 0o755)
+            self.assertEqual(ctx.exception.errno, errno.EEXIST)
+
+    def test_fuse_overlay_rmdir_uses_virtual_children_after_tombstones(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            directory = Path(real_dir) / "dir"
+            directory.mkdir()
+            child = directory / "child.txt"
+            child.write_text("child")
+            deletes = Path(project) / "deletes.txt"
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=Path(project) / "overlay", deletes_file=deletes)
+
+            ops.unlink(str(child))
+            self.assertEqual([entry for entry in ops.readdir(str(directory), None) if entry not in (".", "..")], [])
+            ops.rmdir(str(directory))
+
+            deleted = deletes.read_text()
+            self.assertIn(str(child.resolve(strict=False)), deleted)
+            self.assertIn(str(directory.resolve(strict=False)), deleted)
+
+    def test_fuse_overlay_rename_stages_new_path_and_tombstones_old_path(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            old = Path(real_dir) / "old.txt"
+            new = Path(real_dir) / "new.txt"
+            old.write_text("real")
+            overlay = Path(project) / "overlay"
+            deletes = Path(project) / "deletes.txt"
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=overlay, deletes_file=deletes)
+
+            ops.rename(str(old), str(new))
+
+            staged_new = overlay / str(new.resolve(strict=False)).lstrip("/")
+            self.assertEqual(staged_new.read_text(), "real")
+            self.assertTrue(old.exists())
+            self.assertFalse(new.exists())
+            self.assertIn(str(old.resolve(strict=False)), deletes.read_text())
+
+    def test_fuse_overlay_write_to_symlink_does_not_modify_real_target(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_dir:
+            target = Path(real_dir) / "target.txt"
+            target.write_text("real")
+            link = Path(real_dir) / "link.txt"
+            os.symlink(str(target), link)
+            overlay = Path(project) / "overlay"
+            ops = macbox_fuse.ReadOnlyMirrorOperations(overlay_root=overlay, deletes_file=Path(project) / "deletes.txt")
+
+            fh = ops.open(str(link), os.O_WRONLY | os.O_TRUNC)
+            try:
+                ops.write(str(link), b"virtual", 0, fh)
+            finally:
+                ops.release(str(link), fh)
+
+            staged = overlay / str((link.parent.resolve(strict=False) / link.name)).lstrip("/")
+            self.assertEqual(staged.read_text(), "virtual")
+            self.assertFalse(staged.is_symlink())
+            self.assertEqual(target.read_text(), "real")
 
     def test_fuse_backend_mount_starts_helper_and_records_metadata(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:
@@ -415,11 +611,13 @@ class MacBoxTests(unittest.TestCase):
                 self.assertEqual(metadata["status"], "mounted")
                 self.assertEqual(metadata["mountPath"], str(macbox_cli.normalize_abs(mount)))
                 self.assertEqual(metadata["mountPid"], 4242)
-                self.assertTrue(metadata["readOnly"])
+                self.assertFalse(metadata["readOnly"])
                 command = popen.call_args.args[0]
                 self.assertIn(str(helper), command)
                 self.assertIn("--session", command)
                 self.assertIn("--mount", command)
+                self.assertIn("--overlay", command)
+                self.assertIn("--deletes", command)
                 self.assertIn("--foreground", command)
                 self.assertTrue(macbox_cli.mount_record_path("mounted").exists())
             finally:

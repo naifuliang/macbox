@@ -35,9 +35,6 @@ with tempfile.TemporaryDirectory(prefix="macbox-fuse-") as td:
         virtual = mount / str(real.resolve(strict=False)).lstrip("/")
         if virtual.read_text() != "readonly":
             raise SystemExit(f"read-through failed: {virtual}")
-        write = subprocess.run(["/bin/sh", "-c", f"echo blocked > {str(virtual)!r}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if write.returncode == 0:
-            raise SystemExit("write through read-only FUSE mount unexpectedly succeeded")
     finally:
         subprocess.run(["./macbox", "unmount", "--name", session], check=False)
 PY

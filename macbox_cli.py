@@ -139,8 +139,9 @@ def backend_status() -> dict:
             "ready": False,
             "backend": "fuse",
             "readOnlyMountImplemented": True,
-            "writeOverlayImplemented": False,
-            "note": "MacBox production sandboxing requires mounted overlay writes; workspace-only backends are not the mainline.",
+            "writeOverlayImplemented": True,
+            "sessionExecutionImplemented": False,
+            "note": "MacBox production sandboxing requires sessions and apps to launch from the mounted FUSE backend; workspace-only backends are not the mainline.",
         },
         "macfuse": macfuse,
         "homebrew": {
@@ -202,7 +203,7 @@ def backend_doctor_report() -> dict:
             "id": "arbitrary-virtual-paths",
             "ok": False,
             "severity": "blocking",
-            "message": "Production arbitrary-path virtual writes require overlay write support on the mounted backend.",
+            "message": "Production arbitrary-path virtual writes require session execution from the mounted backend.",
         },
         {
             "id": "macfuse-installed",
@@ -236,7 +237,7 @@ def backend_doctor_report() -> dict:
     if any(check["id"] == "python-fuse-binding" for check in blocking):
         next_actions.append("Install a Python FUSE binding for the interpreter that runs MacBox.")
     if any(check["id"] == "arbitrary-virtual-paths" for check in blocking):
-        next_actions.append("Implement overlay writes on the mounted FUSE backend.")
+        next_actions.append("Wire shell and app session execution through the mounted FUSE backend.")
     if not next_actions:
         next_actions.append("Backend dependencies are present; continue mounted overlay verification.")
     return {
@@ -801,7 +802,7 @@ class FuseBackend(SandboxBackend):
         if not status["pythonBinding"]:
             raise SystemExit(
                 "macFUSE appears to be installed, but the Python FUSE binding is unavailable. "
-                "The read-only mount implementation is disabled in this build."
+                "The mounted FUSE overlay backend is disabled in this build."
             )
         return status
 
@@ -844,7 +845,19 @@ class FuseBackend(SandboxBackend):
         helper = fuse_helper_path()
         if not helper.exists():
             raise SystemExit(f"missing FUSE helper: {helper}")
-        command = [sys.executable, str(helper), "--session", name, "--mount", str(mount), "--foreground"]
+        command = [
+            sys.executable,
+            str(helper),
+            "--session",
+            name,
+            "--mount",
+            str(mount),
+            "--overlay",
+            str(overlay_root(name)),
+            "--deletes",
+            str(deletes_path(name)),
+            "--foreground",
+        ]
         if foreground:
             proc = subprocess.Popen(command, cwd=project_root())
             if not wait_for_mount(mount, proc):
@@ -858,13 +871,13 @@ class FuseBackend(SandboxBackend):
                 mountPath=str(mount),
                 mountPid=proc.pid,
                 mountStartedAt=now_iso(),
-                readOnly=True,
+                readOnly=False,
             )
             mount_record_path(name).write_text(json.dumps({
                 "backend": self.name,
                 "mountPath": str(mount),
                 "pid": proc.pid,
-                "readOnly": True,
+                "readOnly": False,
                 "foreground": True,
                 "startedAt": now_iso(),
                 "command": command,
@@ -898,13 +911,13 @@ class FuseBackend(SandboxBackend):
                 mountPath=str(mount),
                 mountPid=proc.pid,
                 mountStartedAt=now_iso(),
-                readOnly=True,
+                readOnly=False,
             )
             mount_record_path(name).write_text(json.dumps({
                 "backend": self.name,
                 "mountPath": str(mount),
                 "pid": proc.pid,
-                "readOnly": True,
+                "readOnly": False,
                 "startedAt": now_iso(),
                 "command": command,
             }, indent=2) + "\n")

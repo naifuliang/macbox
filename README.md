@@ -119,7 +119,8 @@ Homebrew cask path with `--use-brew --execute`. Installing macFUSE alone does
 not make the production backend ready; `backend doctor` also checks the Python
 FUSE binding and the mounted overlay implementation status.
 
-The first mounted backend milestone is read-only:
+The mounted backend can read real paths and stage writes into the session
+overlay:
 
 ```sh
 ./macbox mount --backend fuse --name demo --mount /tmp/macbox-demo
@@ -136,6 +137,7 @@ CLI orchestration paths without touching system mount state.
 ./scripts/verify-prototype.sh
 ./scripts/verify-backend-installer.sh
 ./scripts/verify-fuse-readonly.sh
+./scripts/verify-fuse-overlay-writes.sh
 ```
 
 The integration test uses `sandbox-exec`. If the outer execution environment
