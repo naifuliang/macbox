@@ -3,6 +3,10 @@ import unittest
 import os
 import errno
 import io
+import json
+import shutil
+import subprocess
+import sys
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
@@ -399,6 +403,191 @@ class MacBoxTests(unittest.TestCase):
             run.assert_not_called()
         finally:
             macbox_cli.macfuse_status = old_status
+
+    def test_docker_status_reports_cli_without_daemon(self):
+        result = mock.Mock()
+        result.returncode = 1
+        result.stdout = ""
+        result.stderr = "Cannot connect to the Docker daemon"
+        with mock.patch("macbox_cli.shutil.which", return_value="/usr/local/bin/docker"), \
+                mock.patch("macbox_cli.subprocess.run", return_value=result):
+            status = macbox_cli.docker_status()
+        self.assertTrue(status["available"])
+        self.assertFalse(status["daemon"])
+        self.assertIn("Docker daemon", status["error"])
+
+    def test_docker_install_plan_is_guide_only(self):
+        with mock.patch("macbox_cli.docker_status", return_value={
+            "available": True,
+            "path": "/usr/local/bin/docker",
+            "daemon": False,
+            "serverVersion": None,
+            "context": "desktop-linux",
+            "error": None,
+        }):
+            plan = macbox_cli.backend_install_plan("docker")
+        self.assertEqual(plan["backend"], "docker")
+        self.assertFalse(plan["backendReady"])
+        self.assertFalse(plan["requiresSystemExtensionApproval"])
+        self.assertEqual(plan["steps"][0]["type"], "open")
+
+    def test_backend_status_includes_container_backend(self):
+        with mock.patch("macbox_cli.macfuse_status", return_value={
+            "available": False,
+            "filesystem": None,
+            "framework": None,
+            "mountCommand": None,
+            "pythonBinding": False,
+        }), mock.patch("macbox_cli.docker_status", return_value={
+            "available": True,
+            "path": "/usr/local/bin/docker",
+            "daemon": True,
+            "serverVersion": "29.0.0",
+            "context": "desktop-linux",
+            "error": None,
+        }):
+            status = macbox_cli.backend_status()
+        self.assertEqual(status["containerBackend"], "docker")
+        self.assertTrue(status["containerSandbox"]["ready"])
+        self.assertFalse(status["arbitraryVirtualPaths"]["ready"])
+
+    def test_docker_backend_prepare_shell_builds_isolated_run_command(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as root:
+            old_project_root = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                backend = macbox_cli.docker_backend()
+                with mock.patch.object(backend, "require_available", return_value={
+                    "available": True,
+                    "daemon": True,
+                }):
+                    spec = backend.prepare_shell("docker-launch", ["--", "python", "-c", "print(1)"], None)
+                self.assertEqual(spec.argv[:4], ["docker", "run", "--rm", "-i"])
+                self.assertIn("--network", spec.argv)
+                self.assertIn("none", spec.argv)
+                self.assertIn("python:3.12-slim", spec.argv)
+                self.assertIn("/macbox/session/docker_runner.py", spec.argv)
+                self.assertEqual(spec.argv[-3:], ["python", "-c", "print(1)"])
+                mounts = [spec.argv[idx + 1] for idx, part in enumerate(spec.argv) if part == "-v"]
+                self.assertTrue(any(mount.endswith(":/macbox/session/docker_runner.py:ro") for mount in mounts))
+                self.assertTrue(any(mount.endswith(":/macbox/session/overlay:rw") for mount in mounts))
+                self.assertTrue(any(mount.endswith(":/macbox/session/deletes.txt:rw") for mount in mounts))
+                self.assertFalse(any(mount.endswith(":/macbox/session:rw") for mount in mounts))
+                self.assertTrue(macbox_cli.docker_runner_path("docker-launch").exists())
+                metadata = macbox_cli.read_metadata("docker-launch")
+                self.assertEqual(metadata["backend"], "docker")
+            finally:
+                macbox_cli.project_root = old_project_root
+
+    def test_docker_backend_rejects_missing_roots_instead_of_creating_them(self):
+        with tempfile.TemporaryDirectory() as project:
+            old_project_root = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            missing = Path(project) / "missing"
+            try:
+                backend = macbox_cli.docker_backend()
+                backend.ensure("docker-missing", writes=[str(missing)])
+                with mock.patch.object(backend, "require_available", return_value={
+                    "available": True,
+                    "daemon": True,
+                }):
+                    with self.assertRaises(SystemExit) as ctx:
+                        backend.prepare_shell("docker-missing", ["true"])
+                self.assertIn("existing directory", str(ctx.exception))
+                self.assertFalse(missing.exists())
+            finally:
+                macbox_cli.project_root = old_project_root
+
+    def test_docker_runner_stages_changes_without_real_write(self):
+        with tempfile.TemporaryDirectory() as project:
+            old_project_root = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                host_root = Path("/host/path/not-visible-to-container")
+                backend = macbox_cli.docker_backend()
+                backend.ensure("docker-stage", writes=[str(host_root)])
+                script = macbox_cli.docker_runner_path("docker-stage")
+                command = [
+                    sys.executable,
+                    str(script),
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('created.txt').write_text('container'); Path('kept.txt').write_text('changed'); Path('deleted.txt').unlink()",
+                ]
+                env = os.environ.copy()
+                env["MACBOX_DOCKER_ROOTS"] = str(host_root)
+                env["MACBOX_DOCKER_ROOTS_BASE"] = str(Path(project) / "roots")
+                env["MACBOX_DOCKER_SESSION"] = str(macbox_cli.sandbox_root("docker-stage"))
+                env["MACBOX_DOCKER_WORK"] = str(Path(project) / "work")
+                session = macbox_cli.sandbox_root("docker-stage")
+                roots_base = Path(project) / "roots" / "0"
+                roots_base.mkdir(parents=True)
+                (roots_base / "kept.txt").write_text("real")
+                (roots_base / "unchanged.txt").write_text("same")
+                (roots_base / "deleted.txt").write_text("delete")
+
+                result = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                created = session / "overlay" / str((host_root / "created.txt").resolve(strict=False)).lstrip("/")
+                changed = session / "overlay" / str((host_root / "kept.txt").resolve(strict=False)).lstrip("/")
+                unchanged = session / "overlay" / str((host_root / "unchanged.txt").resolve(strict=False)).lstrip("/")
+                self.assertEqual(created.read_text(), "container")
+                self.assertEqual(changed.read_text(), "changed")
+                self.assertFalse(unchanged.exists())
+                self.assertIn(str(host_root / "deleted.txt"), (session / "deletes.txt").read_text())
+                baseline = json.loads(macbox_cli.docker_baseline_path("docker-stage").read_text())
+                self.assertIn(str(host_root / "created.txt"), baseline)
+                self.assertIn(str(host_root / "kept.txt"), baseline)
+                self.assertIn(str(host_root / "deleted.txt"), baseline)
+                self.assertNotIn(str(host_root / "unchanged.txt"), baseline)
+            finally:
+                macbox_cli.project_root = old_project_root
+
+    def test_docker_apply_refuses_external_host_changes(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_root:
+            old_project_root = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                backend = macbox_cli.docker_backend()
+                real = Path(real_root) / "file.txt"
+                real.write_text("before")
+                backend.ensure("docker-conflict", writes=[real_root])
+                staged = macbox_cli.virtual_path("docker-conflict", str(real))
+                staged.parent.mkdir(parents=True)
+                staged.write_text("container")
+                macbox_cli.docker_baseline_path("docker-conflict").write_text(json.dumps({
+                    str(real.resolve(strict=False)): macbox_cli.describe_host_path(real)
+                }) + "\n")
+
+                real.write_text("outside")
+
+                with self.assertRaises(SystemExit) as ctx:
+                    backend.apply("docker-conflict")
+                self.assertIn("changed since container run", str(ctx.exception))
+                self.assertEqual(real.read_text(), "outside")
+            finally:
+                macbox_cli.project_root = old_project_root
+
+    def test_docker_apply_requires_baseline_for_staged_paths(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as real_root:
+            old_project_root = macbox_cli.project_root
+            macbox_cli.project_root = lambda: Path(project)
+            try:
+                backend = macbox_cli.docker_backend()
+                real = Path(real_root) / "forged.txt"
+                backend.ensure("docker-forged", writes=[real_root])
+                staged = macbox_cli.virtual_path("docker-forged", str(real))
+                staged.parent.mkdir(parents=True)
+                staged.write_text("forged")
+                macbox_cli.docker_baseline_path("docker-forged").write_text("{}\n")
+
+                with self.assertRaises(SystemExit) as ctx:
+                    backend.apply("docker-forged")
+                self.assertIn("without baseline", str(ctx.exception))
+                self.assertFalse(real.exists())
+            finally:
+                macbox_cli.project_root = old_project_root
 
     def test_fuse_backend_mount_reports_unavailable(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as mount:

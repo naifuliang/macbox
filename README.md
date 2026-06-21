@@ -137,6 +137,30 @@ Real mounting requires macFUSE and the Python FUSE binding. Without those
 dependencies, `./scripts/verify-fuse-readonly.sh` still validates the helper and
 CLI orchestration paths without touching system mount state.
 
+## Docker Sandbox Mode
+
+Docker mode is a separate backend for isolated CLI/dev workflows. It keeps the
+macFUSE native filesystem route intact, but lets MacBox run commands inside a
+Docker container without writing to the selected host root.
+
+```sh
+./macbox docker-status
+./macbox backend install --backend docker --dry-run
+./macbox run --backend docker --name docker-demo --write "$PWD" -- \
+  python -c "from pathlib import Path; Path('inside.txt').write_text('docker')"
+./macbox changes --name docker-demo
+```
+
+The Docker backend mounts selected roots read-only, copies them into an isolated
+container workspace, runs the command there, and syncs changed files back into
+`.macbox/sessions/<name>/overlay`. The real host root is not changed until
+`apply`.
+
+This mode is intentionally not a replacement for macFUSE. It does not run macOS
+GUI apps and it does not provide native macOS arbitrary-path filesystem
+semantics. It is the safer default route for container-friendly command-line
+work.
+
 ## Verify
 
 ```sh
@@ -144,6 +168,7 @@ CLI orchestration paths without touching system mount state.
 ./scripts/verify-backend-installer.sh
 ./scripts/verify-fuse-readonly.sh
 ./scripts/verify-fuse-overlay-writes.sh
+./scripts/verify-docker-backend.sh
 ```
 
 The integration test uses `sandbox-exec`. If the outer execution environment
